@@ -30,7 +30,7 @@ class SkyMaskPipe:
             'order_extended': 15,
             'ellip_regs':   '',
             'order_out':    15
-        }
+        } # Do we need to define defaults for all paths? It doesn't have much use
 
         for (prop, val) in defaults.items():
             setattr(self, prop, kwargs.get(prop, val))
@@ -209,7 +209,7 @@ class SkyMaskPipe:
         fmt : string
                   Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
         columns : list of strings
-                  Column names for ra, dec, radius of circles
+                  Colums for ra, dec, radius of circles
         order : integer
                   Pixelization order
                 
@@ -248,7 +248,7 @@ class SkyMaskPipe:
         fmt : string
                   Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
         columns : list of strings
-                  Column names for ra, dec, a, b and pa (position angle) of ellipses
+                  Columns for ra, dec, a, b and pa (position angle) of ellipses
         order : integer
                   Pixelization order
                 
@@ -288,7 +288,7 @@ class SkyMaskPipe:
         fmt : string
                   Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
         columns : list of strings
-                  Column names for ra_center, dec_center, width and height of boxes
+                  Columns for ra_center, dec_center, width and height of boxes
         order : integer
                   Pixelization order
                 
@@ -340,7 +340,7 @@ class SkyMaskPipe:
         fmt : string
                   Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
         columns : list of strings
-                  Column names for ra_center, dec_center, width and height of boxes
+                  Columns for ra, dec for each of the four vertexs 
         order : integer
                   Pixelization order
                 
@@ -378,7 +378,7 @@ class SkyMaskPipe:
 
 
 
-    def build_holes_mask(self, star_regs=None, box_regs=None, fmt='parquet', value=True, order_holes=None, 
+    def build_holes_mask(self, star_regs=None, box_regs=None, fmt='parquet', order_holes=None, 
                          columns_circ=['ra','dec','radius'], 
                          columns_box=['ra_c','dec_c','width','height']):
         """
@@ -396,14 +396,12 @@ class SkyMaskPipe:
                   Path to file (box astropy-regions)
         fmt : string
                   Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
-        value : bool
-                  Set the value of pixels inside stars/boxes
         order_holes : integer
                   Pixelization order
         columns_circ : list of string
-                  Column names for ra, dec, radius of circles                  
+                  Colums for ra, dec, radius of circles                  
         columns_box : list of string
-                  Column names for ra_center, dec_center, width, height of boxes 
+                  Colums for ra_center, dec_center, width, height of boxes 
         
         Returns
         -------
@@ -412,6 +410,10 @@ class SkyMaskPipe:
         """
         if star_regs: self.star_regs=star_regs
         if box_regs: self.box_regs=box_regs
+        self.star_regs_fmt = fmt
+        self.box_regs_fmt = fmt
+        self.star_regs_columns = columns_circ
+        self.box_regs_columns = columns_box
         print('BUILDING BRIGHT STAR HOLES MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
         
         star_pixels = self.pixelate_circles(self.star_regs, fmt=fmt, order=self.order_holes, columns=columns_circ) 
@@ -421,16 +423,42 @@ class SkyMaskPipe:
         nside_holes = 2**self.order_holes
         self.holemap = hsp.HealSparseMap.make_empty(self.nside_cov, nside_holes, dtype=np.bool_)
         # Set the holes to True to invert them later
-        self.holemap[star_pixels] = value
-        self.holemap[box_pixels] = value
+        self.holemap[star_pixels] = True
+        self.holemap[box_pixels] = True
     
         print('--- Holes map area                        :', self.holemap.get_valid_area(degrees=True))
 
 
 
-    def build_user_mask(self, circ_uregs=None, poly_uregs=None, fmt='ascii', value=True, order_user=None,
+    def build_user_mask(self, circ_uregs=None, poly_uregs=None, fmt='ascii', order_user=None,
                         columns_ucirc=['ra','dec','radius'], 
                         columns_upoly=['ra0','ra1','ra2','ra3','dec0','dec1','dec2','dec3']):
+        """
+        Builds a user defined mask from a list of circular and/or quadrangular polygons.
+        Note by default this map's value is set to True, as combine_mask() use it as negative while
+        combining with other maps
+    
+        Parameters
+        ----------
+        circle_uregs : string
+                 Path to file (circular astropy-regions)
+        poly_uregs : string
+                 Path to file (polygon astropy-regions)
+        fmt : string
+                 Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
+        order_user : integer
+                 Pixelization order
+        columns_ucirc : list of strings
+                 Columns for ra, dec, radius
+        columns_upoly : list of strings
+                 Columns for ra, dec for each of the four vertexs  
+        
+        Returns
+        -------
+        hsp_map
+                  healsparse boolean map 
+        """
+        
         if circ_uregs: self.circ_uregs=circ_uregs
         if poly_uregs: self.poly_uregs=poly_uregs
         if order_user: self.order_user=order_user
@@ -442,18 +470,40 @@ class SkyMaskPipe:
         
         if self.circ_uregs:
             circle_pixels = self.pixelate_circles(self.circ_uregs, fmt=fmt, order=self.order_user, columns=columns_ucirc)
-            self.usermap[circle_pixels] = value
+            self.usermap[circle_pixels] = True
     
         if self.poly_uregs:
             poly_pixels = self.pixelate_polys(self.poly_uregs, fmt=fmt, order=self.order_user, columns=columns_upoly)
-            self.usermap[poly_pixels] = value
+            self.usermap[poly_pixels] = True
     
         print('--- User map area                         :', self.usermap.get_valid_area(degrees=True))
 
 
 
-    def build_extended_mask(self, ellip_regs=None, fmt='ascii', value=True, order_extended=None,
+    def build_extended_mask(self, ellip_regs=None, fmt='ascii', order_extended=None,
                             columns_ellip=['ra','dec','a','b','pa']):
+        """
+        Create a holes map corresponding to (elliptical) extended sources.
+        Note by default this map's value is set to True, as combine_mask() use it as negative while
+        combining with other maps
+    
+        Parameters
+        ----------
+        ellip_regs : string
+                 Path to file (elliptical astropy-regions)
+        fmt : string
+                 Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
+        order_extended : integer
+                 Pixelization order
+        columns_ellip : list of strings
+                 Columns for ra, dec, a, b and p.a. for each ellipse 
+                
+        Returns
+        -------
+        hsp_map
+                 healsparse boolean map 
+        """
+
         if ellip_regs: self.ellip_regs=ellip_regs
         if order_extended: self.order_extended=order_extended
         print('BUILDING EXTENDED MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')   
@@ -464,13 +514,32 @@ class SkyMaskPipe:
         
         if self.ellip_regs:
             ellip_pixels = self.pixelate_ellipses(self.ellip_regs, fmt=fmt, order=self.order_user, columns=columns_ellip)
-            self.extendedmap[ellip_pixels] = value
+            self.extendedmap[ellip_pixels] = True
     
         print('--- Extended map area                     :', self.extendedmap.get_valid_area(degrees=True))
 
         
     
     def build_patch_mask(self, patchfile=None, qafile=None, order_patch=None):
+        """
+        For a series of HSC patches, matches them against the QA table containing 
+        quality measurements, filter those that meet some depth/seeing/etc critera,
+        and returns a pixelated map of all accepted patches.
+    
+        Parameters
+        ----------
+        patchfile : list of strings
+                     HSC patch files (e.g. for hectomap, sping, autumn, aegis)
+        qafile : sring
+                     File with the table of patches with QA measurements
+        order_patch : integer
+                     Pixelization order
+                
+        Returns
+        -------
+        hsp_map
+                  healsparse boolean map 
+        """
 
         if patchfile: self.patchfile=patchfile
         if qafile: self.qafile=qafile
@@ -494,7 +563,31 @@ class SkyMaskPipe:
     
     def build_footprint_mask(self, hipcat=None, order_foot=None, columns=['ra_mag','dec_mag'],
                              remove_isopixels=False, erode_borders=False):
+        """
+        Create a footprint map of a source catalog, pixelated at a given order. Optionally remove isolated
+        empty pixels and erode borders around empty zones.
+    
+        Parameters
+        ----------
+        hipcat : string
+                     Path to (hipscatted) catalog
+        order_foot : integer
+                     Pixelization order
+        remove_isopixels : bool
+                     Remove isolated (empty) pixels surrounded by 8 non-empty pixels
+        erode_borders : bool
+                     Detect and remove border pixels around holes
+        columns : list of strings
+                     Columns for ra, dec 
+                
+        Returns
+        -------
+        hsp_map
+                  healsparse boolean map 
+        """
+    
         if hipcat: self.hipcat=hipcat
+        if columns: self.hipcat_columns=columns
         if order_foot: self.order_foot=order_foot
         colra, coldec = columns
         print('BUILDING FOOTPRINT MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
@@ -526,6 +619,32 @@ class SkyMaskPipe:
 
 
     def combine_mask(self, apply_patchmap=True, apply_holemap=True, apply_extendedmap=True, apply_usermap=False):
+        """
+        Combine a footprint map with 4 (optional) masks:
+        1) A patch map containing valid patches
+        2) A holes map due to bright stars/boxes
+        3) A holes map due to extended sources
+        4) A user defined map of arbitrary regions
+    
+        Parameters
+        ----------
+        foot : hsp_map
+               Footprint healsparse map
+        apply_patchmap : bool
+               Apply patch map of accepted patches
+        apply_holemap : bool
+               Apply holes map due to bright stars and boxes
+        apply_extendedmap : bool
+               Apply holes map due to extended sources
+        apply_usermap : bool
+               Apply map of user defined regions
+                
+        Returns
+        -------
+        hsp_map
+                  healsparse boolean map 
+        """
+    
         print('COMBINING MAPS >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
     
         # Upgrade maps if needed up to the desired resolution
@@ -555,8 +674,12 @@ class SkyMaskPipe:
     
         # Create empty map to contain the final mask and perform combination
         self.mask = hsp.HealSparseMap.make_empty(self.nside_cov, self.nside_out, dtype=np.bool_)
-        self.mask |= self.foot
         
+        # Start from footprint map.
+        self.mask |= self.foot
+        # Should we consider an anternative flow with no footmap, and starting from
+        # the usermap?
+
         if apply_patchmap:
             if self.patchmap:
                 self.mask = self.intersect_boolmask(self.patchmap, self.mask)
@@ -609,9 +732,10 @@ class SkyMaskPipe:
         return msk
     
 
-    def plot(self, stage='mask', nr=50_000, s=0.5, **kwargs):
+    def plot(self, stage='mask', nr=50_000, s=0.5, figsize=[12,6], xwin=None, ywin=None, 
+             plot_stars=False, plot_boxes=False, use_srcs=False, ax=None, **kwargs):
         """
-        Quickly visualize a mask by means of its randoms points
+        Visualize a mask by means of its randoms points
         
         Parameters
         ----------
@@ -621,6 +745,16 @@ class SkyMaskPipe:
                   Number of randoms        
         s : float
                   Point size
+        figsize : list of floats
+                  Figure size, e.g. [12,6]
+        xwin, ywin : list of floats
+                  plot limits in ra and dec, e.g. xwin=[226.5,227.5], ywin=[10.,11.]
+        plot_stars, plot_boxes : bool
+                  Overlay circles and boxes due to bright stars
+        user_srcs : bool
+                  Plot input sources used to build the footprint map, instead of random points
+        ax : axes
+                  If given, plot will be added to the given axes objects
         kwargs : [key=val]
                   Adittional keyword arguments passed to mataplolib.scatter()
         """
@@ -630,12 +764,87 @@ class SkyMaskPipe:
         if stage == 'extendedmap': mk = self.extendedmap
         if stage == 'usermap':     mk = self.usermap
         if stage == 'mask':        mk = self.mask
-        rra, rdec = hsp.make_uniform_randoms_fast(mk, nr)
+            
+        if use_srcs:
+            # Use catalog for scatter plot
+            srcs = lsdb.read_hipscat(self.hipcat, columns=self.hipcat_columns).compute()
+            xx, yy = srcs[self.hipcat_columns[0]], srcs[self.hipcat_columns[1]]
+            stage = 'sources'
+        else:
+             # Use randoms for scatter plot
+             xx, yy = hsp.make_uniform_randoms_fast(mk, nr)
+
+        # Do plot ------------------------------------------
+        if not(ax): fig, ax = plt.subplots(figsize=figsize)
+        ax.scatter(xx, yy, s=s, **kwargs)
+        ax.set_title(stage)
+        if xwin: ax.set_xlim(xwin)
+        if ywin: ax.set_ylim(ywin)
+        xwin=ax.get_xlim()  ;  ywin=ax.get_ylim()
+
+        if plot_stars:
+            stars = Table.read(self.star_regs, format=self.star_regs_fmt)
+            colra, coldec, colrad = self.star_regs_columns
+            idx = (stars[colra]>xwin[0]) & (stars[colra]<xwin[1]) & (stars[coldec]>ywin[0]) & (stars[coldec]<ywin[1])
+            ts = stars[idx]
+            for i in range(len(ts)):
+                star_ra, star_dec, star_rad = ts[colra][i], ts[coldec][i], ts[colrad][i] 
+                circ = plt.Circle((star_ra, star_dec), star_rad, color='r', fill=False, linewidth=0.4)
+                ax.add_artist(circ)
+                #print(i, (ts[colra][i], ts[coldec][i]), ts[colrad][i])
         
-        plt.figure(figsize=(12,8))
-        plt.scatter(rra, rdec, s=s, **kwargs)
-        plt.show()
+        if plot_boxes:
+            # read boxes to overplot boxes
+            boxes = Table.read(self.box_regs, format=self.box_regs_fmt)
+            ra_c, dec_c, width, height = self.box_regs_columns
+            boxes['corner_ra']=boxes[ra_c]-0.5*boxes[width]   # assume no box crosses 360 boundary 
+            boxes['corner_dec']=boxes[dec_c]-0.5*boxes[height]
+            
+            idxb = (boxes[ra_c]>xwin[0]) & (boxes[ra_c]<xwin[1]) & (boxes[dec_c]>ywin[0]) & (boxes[dec_c]<ywin[1])
+            tsb = boxes[idxb]
+            for i in range(len(tsb)):
+                box_ra, box_dec, box_sx, box_sy = tsb['corner_ra'][i], tsb['corner_dec'][i], tsb[width][i], tsb[height][i]
+                rec = plt.Rectangle((box_ra, box_dec), box_sx, box_sy, color='r', fill=False, linewidth=0.4)
+                ax.add_artist(rec)
+                #print(i, box_ra, box_dec, box_sx, box_sy)
         
+        plt.tight_layout()
+        #if not(ax): plt.show()
+
+        
+
+    def plot2compare(self, stage='mask', nr=50_000, s=0.5, figsize=[12,6], xwin=None, ywin=None, 
+                     plot_stars=False, plot_boxes=False, **kwargs):
+        """
+        Compare input sources and random points generate over a mask
+        
+        Parameters
+        ----------
+        stage : string
+                  Masking stage to use, e.g. 'mask', 'foot', 'holemap', etc.
+        nr : integer
+                  Number of randoms        
+        s : float
+                  Point size
+        figsize : list of floats
+                  Figure size, e.g. [12,6]
+        xwin, ywin : list of floats
+                  plot limits in ra and dec, e.g. xwin=[226.5,227.5], ywin=[10.,11.]
+        plot_stars, plot_boxes : bool
+                  Overlay circles and boxes due to bright stars
+        kwargs : [key=val]
+                  Adittional keyword arguments passed to mataplolib.scatter()
+        """
+        fig, (ax1, ax2) = plt.subplots(1,2, figsize=figsize)
+        
+        self.plot(stage=stage, nr=nr, s=s, figsize=[figsize[0]*0.5, figsize[1]], xwin=xwin, ywin=ywin, 
+                  plot_stars=plot_stars, plot_boxes=plot_boxes, use_srcs=True, ax=ax1 ,**kwargs)
+
+        self.plot(stage=stage, nr=nr, s=s, figsize=[figsize[0]*0.5, figsize[1]], xwin=xwin, ywin=ywin, 
+                  plot_stars=plot_stars, plot_boxes=plot_boxes, use_srcs=False, ax=ax2, **kwargs)
+
+
+
 
     def makerans(self, stage='mask', nr=50_000, file=None, **kwargs):
         """
@@ -707,94 +916,3 @@ class SkyMaskPipe:
 
         return cat[idx]
 
-
-
-# # Subclassing HealSparseMap
-# class SkyMask(hsp.HealSparseMap):
-#     def __init__(self, *args, **kwargs):
-#         # Call the superclass constructor
-#         super().__init__(*args, **kwargs)
-
-#     # Add custom methods
-#     def plot(self, nr=50_000, s=1, **kwargs):
-#         """
-#         Plot the HealSparse map using matplotlib.
-        
-#         :param kwargs: Additional arguments to pass to the plot.
-#         """
-#         rra, rdec = hsp.make_uniform_randoms_fast(self, nr)
-        
-#         plt.figure()
-#         plt.scatter(rra, rdec, s=s, **kwargs)
-#         plt.show()
-
-#     def intersect_boolmask(self, mask2):
-
-#         tmp = self & mask2
-#         msk = mask2 & tmp
-#         return msk
-
-
-
-
-
-
-# class SkyMask:
-#     def __init__(self, **kwargs):
-#         defaults = {
-#             "order": 12,
-#             "order_cov": 4
-#         }
-
-#         for (prop, val) in defaults.items():
-#             setattr(self, prop, kwargs.get(prop, val))
-        
-#         self.nside = 2**self.order
-#         self.nside_cov = 2**self.order_cov
-#         self._hs = hsp.HealSparseMap.make_empty(self.nside_cov, self.nside, dtype=np.bool_)
-
-#     # using property decorator --> a getter function 
-#     @property
-#     def hs(self): 
-#          print("getter method called") 
-#          return self._hs 
-
-#     # a setter function 
-#     @hs.setter 
-#     def hs(self, hsmap): 
-#         print("setter method called") 
-#         self._hs = hsmap
-#         self.nside = hsmap.nside_sparse 
-#         self.nside_cov = hsmap.nside_coverage 
-#         self.order = math.log2(hsmap.nside_sparse)
-#         self.order_cov = math.log2(hsmap.nside_coverage)
-
-#     def __str__(self):
-#         return self.hs
-
-#     def intersect(self, mask2):
-#         pass
-
-#     def apply(self, table, colra='ra_mag', coldec='dec_mag', file=''):
-#         pass
-    
-#     def makerans(self, nr=100_000, file='', colra='ra', coldec='dec'):
-#         pass
-
-#     def plot(self, s=1):
-#         pass
-    
-
-
-
-
-# class Neuron():
-
-#     def __init__(self, **kwargs):
-#         prop_defaults = {
-#             "num_axon_segments": 0,
-#             "apical_bifibrications": "fancy default"
-#         }
-
-#         for (prop, default) in prop_defaults.items():
-#             setattr(self, prop, kwargs.get(prop, default))
