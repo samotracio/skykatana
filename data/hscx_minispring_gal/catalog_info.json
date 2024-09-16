@@ -1,0 +1,8 @@
+{
+    "catalog_name": "hscx_minispring_gal",
+    "catalog_type": "object",
+    "total_rows": 7923053,
+    "epoch": "J2000",
+    "ra_column": "ra_mag",
+    "dec_column": "dec_mag"
+}
