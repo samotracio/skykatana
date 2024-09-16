@@ -23,7 +23,7 @@ Main Methods
 * ``build_footprint_mask, build_patch_mask, build_holes_mask, etc``
     Generate maps for each stage
 * ``combine_mask``
-    Merges the maps create above to general a final mask
+    Merges the maps created above to generate a final mask
 * ``plot``
     Visualize a mask stage by plotting randoms. Options to zoom, oveplot stars, etc.
 * ``plot2compare``

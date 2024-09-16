@@ -7,9 +7,30 @@ from astropy.table import Table, join
 from astropy.coordinates import Angle, Latitude, Longitude, SkyCoord
 from mocpy import MOC
 from tqdm import tqdm
+import re
+
 
 
 class SkyMaskPipe:
+    """A class to work with sky mask in a pipeline way
+
+    If the class has public attributes, they may be documented here
+    in an ``Attributes`` section and follow the same formatting as a
+    function's ``Args`` section. Alternatively, attributes may be documented
+    inline with the attribute's declaration (see __init__ method below).
+
+    Properties created with the ``@property`` decorator should be documented
+    in the property's getter method.
+
+    Attributes
+    ----------
+    attr1 : str
+        Description of `attr1`.
+    attr2 : :obj:`int`, optional
+        Description of `attr2`.
+
+    """
+
     def __init__(self, **kwargs):
         defaults = {
             'order_cov':    4,            
@@ -65,8 +86,25 @@ class SkyMaskPipe:
         return pqa
 
 
+
     @staticmethod
-    def filter_and_pixelate_patches(file, qatable, order=13):
+    def parse_condition(condition_str):
+        # Replace 'and' and 'or' with '&' and '|' for element-wise comparison
+        condition_str = condition_str.replace("and", "&").replace("or", "|")
+        
+        # Add "table['column_name']" around each column name
+        # We assume column names consist of letters, numbers, or underscores
+        pattern = r'(\b[a-zA-Z_]\w*\b)'
+        
+        # Substitute column names to be used as table['column_name']
+        condition_str = re.sub(pattern, r"table['\1']", condition_str)
+        
+        return condition_str
+
+
+
+    @staticmethod
+    def filter_and_pixelate_patches(file, qatable, order=13, filt=None):
         """
         Reads a file with HSC patches, matches it against the QA table containing quality measures
         of each patch, filter those that meet some depth/seeing/etc critera, and return their 
@@ -99,9 +137,14 @@ class SkyMaskPipe:
         table = join(table, qatable, keys='skymap_id')
         print('    Patches with QA                       :', len(table))
     
-        # Apply uniformity criteria to patches based on minimum depth. This gets rids of border zones.
-        idx = (table['gmag_psf_depth']>26.2) & (table['rmag_psf_depth']>25.9) & (table['imag_psf_depth']>25.7)
-        print('    Patches with QA fulfilling conditions :', len(table[idx]))
+        if filt:
+            # Apply uniformity criteria to patches based on minimum depth. This gets rids of border zones.
+            filt_goodstr = __class__.parse_condition(filt)
+            idx = eval(filt_goodstr)
+            print('    Patches with QA fulfilling conditions :', len(table[idx]))
+        else:
+            idx = np.full(len(table), fill_value=True, dtype=np.bool_)
+            print('    Patches adopted (no filters applied) :', len(table[idx]))
     
         # Change to float64 because moc complains otherise
         table['ra0']=table['ra0'].astype(np.float64)
@@ -520,7 +563,8 @@ class SkyMaskPipe:
 
         
     
-    def build_patch_mask(self, patchfile=None, qafile=None, order_patch=None):
+    def build_patch_mask(self, patchfile=None, qafile=None, order_patch=None,
+                         filt="(gmag_psf_depth>26.2) and (rmag_psf_depth>25.9) and (imag_psf_depth>25.7)"):
         """
         For a series of HSC patches, matches them against the QA table containing 
         quality measurements, filter those that meet some depth/seeing/etc critera,
@@ -554,7 +598,7 @@ class SkyMaskPipe:
         self.patchmap = hsp.HealSparseMap.make_empty(self.nside_cov, nside_patch, dtype=np.bool_)
         
         for p in self.patchfile:
-            fpx = self.filter_and_pixelate_patches(p, qatable, order=self.order_patch)
+            fpx = self.filter_and_pixelate_patches(p, qatable, order=self.order_patch, filt=filt)
             self.patchmap[fpx] = True
     
         print('--- Patch map area                        :', self.patchmap.get_valid_area(degrees=True))
@@ -881,25 +925,24 @@ class SkyMaskPipe:
 
     def apply(self, stage='mask', cat=None, columns=['ra','dec'], file=None):
         """
-        Apply a mask to catalog (dataframe/astropy_table) and optionally save it to disk
-    
+        Apply a mask to a catalog (DataFrame or Astropy Table) and optionally save it to disk.
+
         Parameters
         ----------
-        stage : string
-                  Masking stage to use, e.g. 'mask', 'foot', 'holemap', etc.
-        cat : dataframe/astropy_table
-                  Input catalog
-        columns : list of strings
-                  Columns for RA and DEC coordinates
-        file : string
-                  Output file (parquet format)
-                
+        stage : str
+            Masking stage to use, e.g., 'mask', 'foot', 'holemap', etc.
+        cat : pandas.DataFrame or astropy.table.Table
+            Input catalog to which the mask will be applied.
+        columns : list of str
+            Columns for RA and DEC coordinates.
+        file : str, optional
+            Path to the output file where the result will be saved in parquet format. If not provided, the result is not saved.
+
         Returns
         -------
-        dataframe/astropy_table
-                  Input catalog with mask applied 
+        pandas.DataFrame or astropy.table.Table
+            The input catalog with the mask applied.
         """
-        
         colra, coldec = columns
         if stage == 'foot':        mk = self.foot
         if stage == 'patchmap':    mk = self.patchmap
