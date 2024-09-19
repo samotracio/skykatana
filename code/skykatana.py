@@ -36,23 +36,12 @@ class SkyMaskPipe:
         defaults = {
             'order_cov':    4,            
             'order_foot':   13,
-            'hipcat':       '/home/edonoso/hscmags/hscx_hectomap_gal/',
-            'qafile':       '/home/edonoso/hsc_patches/patch_qa.csv',
             'order_patch':  13,
-            'patchfile':    ['/home/edonoso/hsc_patches/tracts_patches_W-hectomap.parquet', 
-                             '/home/edonoso/hsc_patches/tracts_patches_W-spring.parquet',
-                             '/home/edonoso/hsc_patches/tracts_patches_W-AEGIS.parquet',
-                             '/home/edonoso/hsc_patches/tracts_patches_W-autumn.parquet'],
             'order_holes':  15,
-            'star_regs':    '/home/edonoso/hsc_bsregions/stars.reg.I.nodups.parquet',
-            'box_regs':     '/home/edonoso/hsc_bsregions/box.reg.I.parquet',
             'order_user':   15,
-            'circ_uregs':   '',
-            'poly_uregs':   '',
             'order_extended': 15,
-            'ellip_regs':   '',
             'order_out':    15
-        } # Do we need to define defaults for all paths? It doesn't have much use
+        }
 
         for (prop, val) in defaults.items():
             setattr(self, prop, kwargs.get(prop, val))
@@ -65,6 +54,14 @@ class SkyMaskPipe:
         self.usermap     = None
         self.extendedmap = None
         self.mask        = None
+        self.hipcat      = None
+        self.qafile      = None
+        self.patchfile   = None
+        self.star_regs   = None
+        self.box_regs    = None
+        self.circ_uregs  = None
+        self.poly_uregs  = None
+        self.ellip_regs  = None
         
 
     @staticmethod
