@@ -12,23 +12,24 @@ import re
 
 
 class SkyMaskPipe:
-    """A class to work with sky mask in a pipeline way
+    """
 
-    If the class has public attributes, they may be documented here
-    in an ``Attributes`` section and follow the same formatting as a
-    function's ``Args`` section. Alternatively, attributes may be documented
-    inline with the attribute's declaration (see __init__ method below).
-
-    Properties created with the ``@property`` decorator should be documented
-    in the property's getter method.
+    A class to work with healsparse sky masks in a pipeline way
 
     Attributes
     ----------
-    attr1 : str
-        Description of `attr1`.
-    attr2 : :obj:`int`, optional
-        Description of `attr2`.
-
+    order_cov : int
+        Coverage order of (all) healsparse maps.
+    order_foot : int
+        Order for the footprint map
+    order_patch : int
+        Order for the patch map
+    order_holes : int
+        Order for the holes map due to bright stars/boxes
+    order_extended : int
+        Order for the extended sources map
+    order_user : int
+        Order for user defined map
     """
 
     def __init__(self, **kwargs):
@@ -69,18 +70,19 @@ class SkyMaskPipe:
     @staticmethod
     def readQApatches(qafile):
         """
-        Read contents of HSC QA patch list
+        Read contents of HSC QA patch list.
+
         See https://hsc-release.mtk.nao.ac.jp/schema/#pdr3.pdr3_wide.patch_qa
     
         Parameters
         ----------
         qafile : string
-                 File path
+            File path
                 
         Returns
         -------
         astropy table
-                 Table with QA patches 
+            Table with QA patches
         """
         pqa = Table.read(qafile)
         return pqa
@@ -89,22 +91,35 @@ class SkyMaskPipe:
 
     @staticmethod
     def parse_condition(condition_str):
-        # Replace 'and' and 'or' with '&' and '|' for element-wise comparison
-        condition_str = condition_str.replace("and", "&").replace("or", "|")
+        """
+        Parses a condition string, converting column names into a format usable for direct evaluation over an astropy table.
+        For example, converts "(ra>20) and (dec<30)" into "(table['ra']>20) & (table['dec']<30)".
+    
+        Parameters
+        ----------
+        condition_str : str
+            Condition string, e.g., "(gmag>20.4) and (imag>19.8)"
+    
+        Returns
+        -------
+        str
+            Condition in new format
+        """
+        # Regex to match alphanumeric + underscores after a '(' and before a comparison operator (<, >, =, !=)
+        pattern = r'\(([\w_]+)(?=[<>!=])'
         
-        # Add "table['column_name']" around each column name
-        # We assume column names consist of letters, numbers, or underscores
-        pattern = r'(\b[a-zA-Z_]\w*\b)'
+        # Substitute the matched column names with table['column_name']
+        condition_str = re.sub(pattern, r"(table['\1']", condition_str)
         
-        # Substitute column names to be used as table['column_name']
-        condition_str = re.sub(pattern, r"table['\1']", condition_str)
+        # Use regex to replace 'and' and 'or' as standalone words, not as substrings within column names
+        condition_str = re.sub(r'\band\b', '&', condition_str)
+        condition_str = re.sub(r'\bor\b', '|', condition_str)
         
         return condition_str
 
 
-
     @staticmethod
-    def filter_and_pixelate_patches(file, qatable, order=13, filt=None):
+    def filter_and_pixelate_patches(file, qatable, filt=None, order=13):
         """
         Reads a file with HSC patches, matches it against the QA table containing quality measures
         of each patch, filter those that meet some depth/seeing/etc critera, and return their 
@@ -115,17 +130,20 @@ class SkyMaskPipe:
     
         Parameters
         ----------
-        file : string
-                  HSC patch file (defult parquet, but anything astropy can read)
+        file : str
+            HSC patch file (defult parquet, but anything astropy can read)
         qatable : astropy table
-                  Table of patches with QA measurements
-        order : integer
-                  Pixelization order
+            Table of patches with QA measurements
+        order : int
+            Pixelization order
+        filt : str
+            Contition(s) to apply to patches, e.g filt='(ra>20) and (dec<10)'. If None,
+            all patches will be considered
                 
         Returns
         -------
         ndarray
-                  Array of pixels inside patches fulfilling the patch selection criteria 
+            Array of pixels inside patches fulfilling the patch selection criteria
         """
         
         # Read patch file
@@ -177,13 +195,13 @@ class SkyMaskPipe:
     
         Parameters
         ----------
-        hsp_map
-                 healsparse boolean map 
+        hsmap
+            Healsparse boolean map
                 
         Returns
         -------
-        hsp_map
-                 healsparse boolean map without empty single pixels
+        hsmap
+            Healsparse boolean map
         """
         print('    ...removing isolated pixels...')
         from collections import Counter
@@ -208,17 +226,16 @@ class SkyMaskPipe:
         the external border of regions, and set those border pixels off. This can 
         help to remove jagged boundaries around empty regions, when pixelated
         at relatively coarse resolutions.
-        
     
         Parameters
         ----------
-        hsp_map
-                 healsparse boolean map 
+        hsmap
+            Healsparse boolean map
                 
         Returns
         -------
-        hsp_map
-                 healsparse boolean map with eroded borders
+        hsmap
+            Healsparse boolean map
         """        
         print('    ...eroding borders...')
         nborders = 8
@@ -247,19 +264,19 @@ class SkyMaskPipe:
     
         Parameters
         ----------
-        file : string
-                  Path to file (circular astropy-regions)
-        fmt : string
-                  Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
-        columns : list of strings
-                  Colums for ra, dec, radius of circles
-        order : integer
-                  Pixelization order
+        file : str
+            Path to file
+        fmt : str
+            Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
+        columns : list of str
+            Colums for ra, dec, radius of circles
+        order : int
+            Pixelization order
                 
         Returns
         -------
         ndarray
-                  Array of pixels 
+            Array of pixels
         """
         colra, coldec, colrad = columns
         
@@ -286,19 +303,19 @@ class SkyMaskPipe:
     
         Parameters
         ----------
-        file : string
-                  Path to file (circular astropy-regions)
-        fmt : string
-                  Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
-        columns : list of strings
-                  Columns for ra, dec, a, b and pa (position angle) of ellipses
-        order : integer
-                  Pixelization order
+        file : str
+            Path to file
+        fmt : str
+            Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
+        columns : list of str
+            Columns for ra, dec, a, b and pa (position angle) of ellipses
+        order : int
+            Pixelization order
                 
         Returns
         -------
         ndarray
-                  Array of pixels 
+            Array of pixels
         """        
         MOCPY_DEPTH_DELTA = 3    # precision of healpix filtering when applying from_cones()
         print('--- Pixelating ellipses from', file)
@@ -326,19 +343,19 @@ class SkyMaskPipe:
         
         Parameters
         ----------
-        file : string
-                  Path to file (box astropy-regions)
-        fmt : string
-                  Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
-        columns : list of strings
-                  Columns for ra_center, dec_center, width and height of boxes
-        order : integer
-                  Pixelization order
+        file : str
+            Path to file
+        fmt : str
+            Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
+        columns : list of str
+            Columns for ra_center, dec_center, width and height of boxes
+        order : int
+            Pixelization order
                 
         Returns
         -------
         ndarray
-                  Array of pixels 
+            Array of pixels
         """        
         colra, coldec, colw, colh = columns
         
@@ -373,24 +390,24 @@ class SkyMaskPipe:
     def pixelate_polys(file, fmt='ascii', columns=['ra0','ra1','ra2','ra3','dec0','dec1','dec2','dec3'], order=15):
         """
         Read quadrangular polygons, pixelize them and return the (unique) pixels inside.
-        Input data must have 8 columns for the coordinates of the 4 vertices
+        Input data must have 8 columns for the coordinates of the 4 vertices.
         Coordinates and distances should be in degrees.
     
         Parameters
         ----------
-        file : string
-                  Path to file (polygon astropy-regions)
-        fmt : string
-                  Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
-        columns : list of strings
-                  Columns for ra, dec for each of the four vertexs 
-        order : integer
-                  Pixelization order
+        file : str
+            Path to file
+        fmt : str
+            Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
+        columns : list of str
+            Columns for ra, dec for each of the four vertexs
+        order : int
+            Pixelization order
                 
         Returns
         -------
         ndarray
-                  Array of pixels 
+            Array of pixels
         """
         cr0, cr1, cr2, cr3, cd0, cd1, cd2, cd3 = columns
         
@@ -426,30 +443,28 @@ class SkyMaskPipe:
                          columns_box=['ra_c','dec_c','width','height']):
         """
         Create a holes map corresponding to (circular and box regions) around bright stars
-        (add reference [xxxx]).
-        
-        Note by default this map's value is set to True, as combine_mask() use it as negative while
-        combining with other maps
+        (add reference to J.Coupon files [xxxx]). Note by default this map's value is set to True,
+        as combine_mask() use it as negative while combining with other maps
     
         Parameters
         ----------
-        star_regs : string
-                  Path to file (circular astropy-regions)
+        star_regs : str
+            Path to file (circular astropy-regions)
         box_regs : bool
-                  Path to file (box astropy-regions)
-        fmt : string
-                  Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
-        order_holes : integer
-                  Pixelization order
-        columns_circ : list of string
-                  Colums for ra, dec, radius of circles                  
-        columns_box : list of string
-                  Colums for ra_center, dec_center, width, height of boxes 
+            Path to file (box astropy-regions)
+        fmt : str
+            Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
+        order_holes : int
+            Pixelization order
+        columns_circ : list of str
+            Colums for ra, dec, radius of circles
+        columns_box : list of str
+            Colums for ra_center, dec_center, width, height of boxes
         
         Returns
         -------
         hsp_map
-                  healsparse boolean map 
+            Healsparse boolean map
         """
         if star_regs: self.star_regs=star_regs
         if box_regs: self.box_regs=box_regs
@@ -478,28 +493,26 @@ class SkyMaskPipe:
                         columns_upoly=['ra0','ra1','ra2','ra3','dec0','dec1','dec2','dec3']):
         """
         Builds a user defined mask from a list of circular and/or quadrangular polygons.
-        Note by default this map's value is set to True, as combine_mask() use it as negative while
-        combining with other maps
-    
+
         Parameters
         ----------
-        circle_uregs : string
-                 Path to file (circular astropy-regions)
-        poly_uregs : string
-                 Path to file (polygon astropy-regions)
-        fmt : string
-                 Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
-        order_user : integer
-                 Pixelization order
-        columns_ucirc : list of strings
-                 Columns for ra, dec, radius
-        columns_upoly : list of strings
-                 Columns for ra, dec for each of the four vertexs  
+        circ_uregs : str
+            Path to file (circular astropy-regions)
+        poly_uregs : str
+            Path to file (polygon astropy-regions)
+        fmt : str
+            Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
+        order_user : int
+            Pixelization order
+        columns_ucirc : list of str
+            Columns for ra, dec, radius
+        columns_upoly : list of str
+            Columns for ra, dec for each of the four vertexs
         
         Returns
         -------
         hsp_map
-                  healsparse boolean map 
+            Healsparse boolean map
         """
         
         if circ_uregs: self.circ_uregs=circ_uregs
@@ -532,19 +545,19 @@ class SkyMaskPipe:
     
         Parameters
         ----------
-        ellip_regs : string
-                 Path to file (elliptical astropy-regions)
-        fmt : string
-                 Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
-        order_extended : integer
-                 Pixelization order
-        columns_ellip : list of strings
-                 Columns for ra, dec, a, b and p.a. for each ellipse 
+        ellip_regs : str
+            Path to file (elliptical astropy-regions)
+        fmt : str
+            Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
+        order_extended : int
+            Pixelization order
+        columns_ellip : list of str
+            Columns for ra, dec, a, b and p.a. for each ellipse
                 
         Returns
         -------
         hsp_map
-                 healsparse boolean map 
+            Healsparse boolean map
         """
 
         if ellip_regs: self.ellip_regs=ellip_regs
@@ -572,17 +585,25 @@ class SkyMaskPipe:
     
         Parameters
         ----------
-        patchfile : list of strings
-                     HSC patch files (e.g. for hectomap, sping, autumn, aegis)
-        qafile : sring
-                     File with the table of patches with QA measurements
-        order_patch : integer
-                     Pixelization order
+        patchfile : list of str
+            HSC patch files (e.g. for hectomap, sping, autumn, aegis)
+        qafile : str
+            File with the table of patches with QA measurements
+        order_patch : int
+            Pixelization order
+        filt : string
+            Contition(s) to apply to patches. If None, all patches will be considered
                 
         Returns
         -------
         hsp_map
-                  healsparse boolean map 
+            Healsparse boolean map
+
+        The filt keyword
+        ----------------
+        The filt keyword can be a string to filter which patches will be pixelized later. For example:
+        filt='(imag_psf_depth>26) and (rmag_psf_depth>26.1)'. If filt=None, no filtering will be applied
+        and all patches will be used.
         """
 
         if patchfile: self.patchfile=patchfile
@@ -609,25 +630,25 @@ class SkyMaskPipe:
                              remove_isopixels=False, erode_borders=False):
         """
         Create a footprint map of a source catalog, pixelated at a given order. Optionally remove isolated
-        empty pixels and erode borders around empty zones.
+        empty pixels and erode borders around empty zones. For details see remove_isopixels() and erode_borders()
     
         Parameters
         ----------
-        hipcat : string
-                     Path to (hipscatted) catalog
-        order_foot : integer
-                     Pixelization order
+        hipcat : str
+            Path to (hipscatted) catalog
+        order_foot : int
+            Pixelization order
         remove_isopixels : bool
-                     Remove isolated (empty) pixels surrounded by 8 non-empty pixels
+            Remove isolated (empty) pixels surrounded by 8 non-empty pixels
         erode_borders : bool
-                     Detect and remove border pixels around holes
-        columns : list of strings
-                     Columns for ra, dec 
+            Detect and remove border pixels around holes
+        columns : list of str
+            Columns for ra, dec
                 
         Returns
         -------
         hsp_map
-                  healsparse boolean map 
+            Healsparse boolean map
         """
     
         if hipcat: self.hipcat=hipcat
@@ -664,62 +685,67 @@ class SkyMaskPipe:
 
     def combine_mask(self, apply_patchmap=True, apply_holemap=True, apply_extendedmap=True, apply_usermap=False):
         """
-        Combine a footprint map with 4 (optional) masks:
+        Combine a footprint map with **4 (optional) masks**:
+
         1) A patch map containing valid patches
+
         2) A holes map due to bright stars/boxes
+
         3) A holes map due to extended sources
+
         4) A user defined map of arbitrary regions
     
         Parameters
         ----------
-        foot : hsp_map
-               Footprint healsparse map
         apply_patchmap : bool
-               Apply patch map of accepted patches
+            Apply patch map of accepted patches
         apply_holemap : bool
-               Apply holes map due to bright stars and boxes
+            Apply holes map due to bright stars and boxes
         apply_extendedmap : bool
-               Apply holes map due to extended sources
+            Apply holes map due to extended sources
         apply_usermap : bool
-               Apply map of user defined regions
+            Apply map of user defined regions
                 
         Returns
         -------
         hsp_map
-                  healsparse boolean map 
+            Healsparse boolean map
         """
     
         print('COMBINING MAPS >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
-    
+
         # Upgrade maps if needed up to the desired resolution
         otmp = int(np.log2(self.foot.nside_sparse))
         if otmp < self.order_out:
             print('--- footprint order upgraded to:', self.order_out)
             self.foot = self.foot.upgrade(self.nside_out)
+            self.order_foot = self.order_out
             
         if apply_patchmap and self.patchmap:
             otmp = int(np.log2(self.patchmap.nside_sparse))
             if otmp < self.order_out:
                 print('--- patchmap order upgraded to: ', self.order_out)
                 self.patchmap = self.patchmap.upgrade(self.nside_out)
+                self.order_patch = self.order_out
 
         if apply_usermap and self.usermap:
             otmp = int(np.log2(self.usermap.nside_sparse))
             if otmp < self.order_out:
                 print('--- usermap order upgraded to: ', self.order_out)
                 self.usermap = self.usermap.upgrade(self.nside_out)
+                self.order_user = self.order_out
 
         if apply_extendedmap and self.extendedmap:
             otmp = int(np.log2(self.extendedmap.nside_sparse))
             if otmp < self.order_out:
                 print('--- extendedmap order upgraded to: ', self.order_out)
                 self.extendedmap = self.extendedmap.upgrade(self.nside_out)
+                self.order_extended = self.order_out
 
-    
         # Create empty map to contain the final mask and perform combination
         self.mask = hsp.HealSparseMap.make_empty(self.nside_cov, self.nside_out, dtype=np.bool_)
         
-        # Start from footprint map.
+        # Start from footprint map
         self.mask |= self.foot
         # Should we consider an anternative flow with no footmap, and starting from
         # the usermap?
@@ -759,13 +785,15 @@ class SkyMaskPipe:
     
         Parameters
         ----------
-        mask1, mask2 : hsp_map
-                 Healsparse boolean map
+        mask1 : hsp_map
+            Healsparse boolean map 1
+        mask2 : hsp_map
+            Healsparse boolean map 2
                 
         Returns
         -------
         hsp_map
-                 healsparse boolean map 
+            Healsparse boolean map
         """
         
         if mask1.nside_sparse != mask2.nside_sparse:
@@ -784,23 +812,27 @@ class SkyMaskPipe:
         Parameters
         ----------
         stage : string
-                  Masking stage to use, e.g. 'mask', 'foot', 'holemap', etc.
+            Masking stage to use, e.g. 'mask', 'foot', 'holemap', etc.
         nr : integer
-                  Number of randoms        
+            Number of randoms
         s : float
-                  Point size
+            Point size
         figsize : list of floats
-                  Figure size, e.g. [12,6]
-        xwin, ywin : list of floats
-                  plot limits in ra and dec, e.g. xwin=[226.5,227.5], ywin=[10.,11.]
-        plot_stars, plot_boxes : bool
-                  Overlay circles and boxes due to bright stars
-        user_srcs : bool
-                  Plot input sources used to build the footprint map, instead of random points
+            Figure size
+        xwin : list of floats
+            Plot limits in ra, e.g. xwin=[226.5,227.5]
+        ywin : list of floats
+            Plot limits in dec, e.g. ywin=[10.,11.]
+        plot_stars : bool
+            Overlay circles due to bright stars
+        plot_boxes : bool
+            Overlay boxes due to bright stars
+        use_srcs : bool
+            Plot input sources used to build the footprint map, instead of random points. Note this means that no mask of any kind is actually plotted
         ax : axes
-                  If given, plot will be added to the given axes objects
+            If given, plot will be added to the axes object provided
         kwargs : [key=val]
-                  Adittional keyword arguments passed to mataplolib.scatter()
+            Adittional keyword arguments passed to mataplolib.scatter()
         """
         if stage == 'foot':        mk = self.foot
         if stage == 'patchmap':    mk = self.patchmap
@@ -865,19 +897,23 @@ class SkyMaskPipe:
         Parameters
         ----------
         stage : string
-                  Masking stage to use, e.g. 'mask', 'foot', 'holemap', etc.
-        nr : integer
-                  Number of randoms        
+            Masking stage to use, e.g. 'mask', 'foot', 'holemap', etc.
+        nr : int
+            Number of randoms
         s : float
-                  Point size
+            Point size
         figsize : list of floats
-                  Figure size, e.g. [12,6]
-        xwin, ywin : list of floats
-                  plot limits in ra and dec, e.g. xwin=[226.5,227.5], ywin=[10.,11.]
-        plot_stars, plot_boxes : bool
-                  Overlay circles and boxes due to bright stars
+            Figure size
+        xwin : list of floats
+            plot limits in ra, e.g. xwin=[226.5,227.5]
+        ywin : list of floats
+            plot limits in dec, e.g. ywin=[10.,11.]
+        plot_stars : bool
+            Overlay circles due to bright stars
+        plot_boxes : bool
+            Overlay boxes due to bright stars
         kwargs : [key=val]
-                  Adittional keyword arguments passed to mataplolib.scatter()
+            Adittional keyword arguments passed to mataplolib.scatter()
         """
         fig, (ax1, ax2) = plt.subplots(1,2, figsize=figsize)
         
@@ -896,17 +932,17 @@ class SkyMaskPipe:
     
         Parameters
         ----------
-        stage : string
-                  Masking stage to use, e.g. 'mask', 'foot', 'holemap', etc.
-        nr : integer
-                  Number of randoms
-        file : string
-                  Output file (fits table)  XXXX change to parquet!
+        stage : str
+            Masking stage to use, e.g. 'mask', 'foot', 'holemap', etc.
+        nr : int
+            Number of randoms
+        file : str, optional
+            Output file (fits table)  XXXX change to parquet!
                 
         Returns
         -------
         dataframe/astropy_table
-                  Input catalog with mask applied 
+            Input catalog with mask applied
         """
         if stage == 'foot':        mk = self.foot
         if stage == 'patchmap':    mk = self.patchmap
@@ -929,7 +965,7 @@ class SkyMaskPipe:
 
         Parameters
         ----------
-        stage : str
+        stage: str
             Masking stage to use, e.g., 'mask', 'foot', 'holemap', etc.
         cat : pandas.DataFrame or astropy.table.Table
             Input catalog to which the mask will be applied.
