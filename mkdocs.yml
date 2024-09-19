@@ -1,0 +1,30 @@
+site_name: Skykatana
+
+nav:
+  - Home: index.md
+  - Intro: intro.md
+  - API: api.md
+
+theme:
+  name: readthedocs
+
+plugins:
+- search:
+- mkdocstrings:
+    handlers:
+      python:
+        options:
+          show_root_heading: yes
+          docstring_style: numpy
+
+# Optional: You can add mkdocstrings options to customize it
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
+
+#  - admonition
+
+extra:
+  python_path: "code"  # Add your src folder to the Python path
+
