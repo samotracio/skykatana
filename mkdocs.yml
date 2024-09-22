@@ -26,5 +26,5 @@ markdown_extensions:
 #  - admonition
 
 extra:
-  python_path: "code"  # Add your src folder to the Python path
+  python_path: "src"  # Add your src folder to the Python path
 
