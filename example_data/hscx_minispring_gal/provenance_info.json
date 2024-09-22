@@ -1,0 +1,25 @@
+{
+    "catalog_name": "hscx_xxxx_gal",
+    "catalog_type": "object",
+    "total_rows": 7923053,
+    "epoch": "J2000",
+    "ra_column": "ra_mag",
+    "dec_column": "dec_mag",
+    "version": "0.3.8",
+    "generation_date": "2024.09.21",
+    "tool_args": {
+        "tool_name": "lsdb",
+        "version": "0.2.9",
+        "runtime_args": {
+            "catalog_name": "hscx_xxxx_gal",
+            "output_path": "./hscx_xxxx_gal",
+            "output_catalog_name": "hscx_xxxx_gal",
+            "catalog_path": "./hscx_xxxx_gal",
+            "catalog_type": "object",
+            "total_rows": 7923053,
+            "epoch": "J2000",
+            "ra_column": "ra_mag",
+            "dec_column": "dec_mag"
+        }
+    }
+}

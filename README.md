@@ -2,26 +2,23 @@
 ---
 ## **Cutting pixelized sky masks in a pipeline way**
 ---
-**Skykatana** is a pacakge to create and maniputate spatial masks on the
-celestial sphere, by combinings healsparse pixel maps accounting for various effects
-such as cutting out regions around bright stars, low depth, bad seeing, extended sources, among others.
-We call these partial maps **stages**, which are then combined into a final mask.
+**Skykatana** is a pacakge to create and maniputate boolean spatial masks on the
+celestial sphere, by combining [healsparse](https://github.com/LSSTDESC/healsparse) pixel maps
+accounting for various effects such as cutting out regions around bright stars, low depth, bad
+seeing, extended sources, among others. We call these partial maps **stages**, which are then
+combined into a final mask.
 
 For each stage you can generate random points, quickly visualize masks, do plots overlaying
 bright stars, and apply the mask to an arbitrary catalog to select sources located inside.
 
-Although mainly designed to work with the HSC-SSP survey, it is flexible to accomodate
-other surveys such as the upcoming half-sky dataset of the Vera Rubin Observatory.
-
----
-* **Quick intro notebook: /code/quick_example_hsc.ipynb**
-* **In-depth notebook: /code/indepth_usage.ipynb**
----
+Although mainly designed to work with the [HSC-SSP survey](https://hsc-release.mtk.nao.ac.jp/doc/),
+it is flexible to accomodate other surveys such as the upcoming half-sky dataset of the
+[Vera Rubin Observatory](https://rubinobservatory.org/).
 
 Main Class
 -------------
 * ``SkyMaskPipe()``
-    Main class for assembling and handling pixelized mask
+    Main class for assembling and handling pixelized masks
 
 Main Methods
 -------------
@@ -40,12 +37,28 @@ Main Methods
 
 Dependencies
 ------------
-1. numpy, astropy, matplotlib, tqdm
-2. healsparse, healpy, mocpy, lsdb
+* [lsdb](https://github.com/astronomy-commons/lsdb), [healsparse](https://github.com/LSSTDESC/healsparse),
+[tqdm](https://github.com/tqdm/tqdm)
 
-Except for healsparse, most dependencies will be covered by installing hipscat-import and lsbd
+Install
+-------
+1. `pip install skykatana`
+2. Clone the repo, switch to the pacakge directory and do `pip install .` . This has the advantage that you will
+get the latest version and all the files in /example_data (~210 MB)
+
+Documentation
+-------------
+* A quick introductory notebook is availables [here](https://github.com/samotracio/skykatana/blob/main/notebooks/quick_example_hsc.ipynb)
+* An indepth tutorial notebook can be found [here](https://github.com/samotracio/skykatana/blob/main/notebooks/indepth_usage.ipynb)
+* The full documentation is available [here](https://skykatana.readthedocs.io/en/latest/)
 
 Credits
 -------
-* [Emilio Donoso](mailto:emiliodon@gmail.com), [Mariano Dominguez](mailto:mariano.dominguez@unc.edu.ar),
-[Claudio Lopez](mailto:yoclaudioantonio1@gmail.com)
+* Main author: [Emilio Donoso](mailto:emiliodon@gmail.com)
+* Contributors: [Mariano Dominguez](mailto:mariano.dominguez@unc.edu.ar),
+[Claudio Lopez](mailto:yoclaudioantonio1@gmail.com), [Konstantin Malanchev](mailto:hombit@gmail.com)
+
+Acknowledgements
+----------------
+This software was partially developed with the generous support of the [LINCC Frameworks Incubator Program](https://lsstdiscoveryalliance.org/programs/lincc-frameworks/incubators/) using LINCC resources. The [healsparse](https://github.com/LSSTDESC/healsparse) code was written by Eli Rykoff and Javier Sanchez
+
