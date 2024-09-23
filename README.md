@@ -42,6 +42,7 @@ Dependencies
 
 Install
 -------
+There are two ways to get skykatana:
 1. `pip install skykatana`
 2. Clone the repo, switch to the pacakge directory and do `pip install .` . This has the advantage that you will
 get the latest version and all the files in /example_data (~210 MB)
