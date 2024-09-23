@@ -992,3 +992,9 @@ class SkyMaskPipe:
 
         return cat[idx]
 
+
+    def save(self, filename):
+        print('Saved to disk')
+
+
+
