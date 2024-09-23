@@ -8,6 +8,7 @@ from astropy.coordinates import Angle, Latitude, Longitude, SkyCoord
 from mocpy import MOC
 from tqdm import tqdm
 import re
+import pickle
 
 
 
@@ -993,8 +994,43 @@ class SkyMaskPipe:
         return cat[idx]
 
 
-    def save(self, filename):
-        print('Saved to disk')
+    def write(self, filename):
+        """
+        Save a SkyMaskPipe object to disk (in a pickled, compressed, optimized format)
 
+        Parameters
+        ----------
+        filename : str
+            Path to the output file
+
+        """
+        import gzip, pickle, pickletools
+        with gzip.open(filename, "wb") as f:
+            pickled = pickle.dumps(self)
+            optimized_pickle = pickletools.optimize(pickled)
+            f.write(optimized_pickle)
+            print(filename, 'saved to disk')
+
+
+    @staticmethod
+    def read(filename):
+        """
+        Read a SkyMaskPipe object from disk
+
+        Parameters
+        ----------
+        file : str
+            Path to file
+
+        Returns
+        -------
+        SkyMaskPipe
+            The SkyMaskPipe instance
+        """
+        import gzip, pickle, pickletools
+        with gzip.open(filename, 'rb') as f:
+            p = pickle.Unpickler(f)
+            mk = p.load()
+        return mk
 
 
