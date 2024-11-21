@@ -55,7 +55,7 @@ class SkyMaskPipe:
         self.usermap     = None
         self.extendedmap = None
         self.mask        = None
-        self.hipcat      = None
+        self.hatscat     = None
         self.qafile      = None
         self.patchfile   = None
         self.star_regs   = None
@@ -624,7 +624,7 @@ class SkyMaskPipe:
     
 
     
-    def build_footprint_mask(self, hipcat=None, order_foot=None, columns=['ra_mag','dec_mag'],
+    def build_footprint_mask(self, hatscat=None, order_foot=None, columns=['ra','dec'],
                              remove_isopixels=False, erode_borders=False):
         """
         Create a footprint map of a source catalog, pixelated at a given order. Optionally remove isolated
@@ -632,8 +632,8 @@ class SkyMaskPipe:
     
         Parameters
         ----------
-        hipcat : str
-            Path to (hipscatted) catalog
+        hatscat : str
+            Path to catalog (HATS directory)
         order_foot : int
             Pixelization order
         remove_isopixels : bool
@@ -649,8 +649,8 @@ class SkyMaskPipe:
             Healsparse boolean map
         """
     
-        if hipcat: self.hipcat=hipcat
-        if columns: self.hipcat_columns=columns
+        if hatscat: self.hatscat=hatscat
+        if columns: self.hatscat_columns=columns
         if order_foot: self.order_foot=order_foot
         colra, coldec = columns
         print('BUILDING FOOTPRINT MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
@@ -659,10 +659,10 @@ class SkyMaskPipe:
         nside_foot   = 2**self.order_foot
         self.foot = hsp.HealSparseMap.make_empty(self.nside_cov, nside_foot, dtype=np.bool_)
         
-        # Read (ra,dec) from a hipscatted catalog
-        print('--- Pixelating hipscat catalog from:', self.hipcat)
+        # Read (ra,dec) from a HATS catalog
+        print('--- Pixelating HATS catalog from:', self.hatscat)
         print('    Order ::',self.order_foot)
-        srcs = lsdb.read_hipscat(self.hipcat, columns=columns).compute() 
+        srcs = lsdb.read_hats(self.hatscat, columns=columns).compute() 
     
         # Get pixel number for each object
         pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True)
@@ -841,8 +841,8 @@ class SkyMaskPipe:
             
         if use_srcs:
             # Use catalog for scatter plot
-            srcs = lsdb.read_hipscat(self.hipcat, columns=self.hipcat_columns).compute()
-            xx, yy = srcs[self.hipcat_columns[0]], srcs[self.hipcat_columns[1]]
+            srcs = lsdb.read_hats(self.hatscat, columns=self.hatscat_columns).compute()
+            xx, yy = srcs[self.hatscat_columns[0]], srcs[self.hatscat_columns[1]]
             stage = 'sources'
         else:
              # Use randoms for scatter plot
