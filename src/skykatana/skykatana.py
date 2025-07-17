@@ -444,9 +444,9 @@ class SkyMaskPipe:
                          columns_circ=['ra','dec','radius'],
                          columns_box=['ra_c','dec_c','width','height']):
         """
-        Create a holes map corresponding to (circular and box regions) around bright stars
-        (add reference to J.Coupon files [xxxx]). Note by default this map's value is set to True,
-        as combine_mask() use it as negative while combining with other maps
+        Create a holes map corresponding to (circular and/or rectangular regions) around bright stars.
+        Note by default this map's value is set to True, as combine_mask() use it as negative while
+        combining with other maps
 
         Parameters
         ----------
@@ -468,23 +468,26 @@ class SkyMaskPipe:
         hsp_map
             Healsparse boolean map
         """
-        if star_regs: self.star_regs=star_regs
-        if box_regs: self.box_regs=box_regs
-        self.star_regs_fmt = fmt
-        self.box_regs_fmt = fmt
-        self.star_regs_columns = columns_circ
-        self.box_regs_columns = columns_box
         print('BUILDING BRIGHT STAR HOLES MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
 
-        star_pixels = self.pixelate_circles(self.star_regs, fmt=fmt, order=self.order_holes, columns=columns_circ)
-        box_pixels = self.pixelate_boxes(self.box_regs, fmt=fmt, order=self.order_holes, columns=columns_box)
+        if star_regs:
+            self.star_regs=star_regs
+            self.star_regs_fmt = fmt
+            self.star_regs_columns = columns_circ
+            star_pixels = self.pixelate_circles(self.star_regs, fmt=fmt, order=self.order_holes, columns=columns_circ)
+
+        if box_regs:
+            self.box_regs=box_regs
+            self.box_regs_fmt = fmt
+            self.box_regs_columns = columns_box
+            box_pixels = self.pixelate_boxes(self.box_regs, fmt=fmt, order=self.order_holes, columns=columns_box)
 
         # Empty boolean map
         nside_holes = 2**self.order_holes
         self.holemap = hsp.HealSparseMap.make_empty(self.nside_cov, nside_holes, dtype=np.bool_)
         # Set the holes to True to invert them later
-        self.holemap[star_pixels] = True
-        self.holemap[box_pixels] = True
+        if star_regs: self.holemap[star_pixels] = True
+        if box_regs: self.holemap[box_pixels] = True
 
         print('--- Holes map area                        :', self.holemap.get_valid_area(degrees=True))
 
@@ -492,7 +495,8 @@ class SkyMaskPipe:
 
     def build_user_mask(self, circ_uregs=None, poly_uregs=None, fmt='ascii', order_user=None,
                         columns_ucirc=['ra','dec','radius'],
-                        columns_upoly=['ra0','ra1','ra2','ra3','dec0','dec1','dec2','dec3']):
+                        columns_upoly=['ra0','ra1','ra2','ra3','dec0','dec1','dec2','dec3'],
+                        usermap_type = 'positive'):
         """
         Builds a user defined mask from a list of circular and/or quadrangular polygons.
 
@@ -510,6 +514,8 @@ class SkyMaskPipe:
             Columns for ra, dec, radius
         columns_upoly : list of str
             Columns for ra, dec for each of the four vertexs
+        usermap_type : str
+            If 'positive'('negative'), combine_mask() will perform an intersection(subtraction)
 
         Returns
         -------
@@ -533,6 +539,11 @@ class SkyMaskPipe:
         if self.poly_uregs:
             poly_pixels = self.pixelate_polys(self.poly_uregs, fmt=fmt, order=self.order_user, columns=columns_upoly)
             self.usermap[poly_pixels] = True
+
+        if usermap_type in ['positive','negative']:
+            self.usermap_type = usermap_type
+        else:
+            raise Exception('usermap_type should be "postive" or "negative"')
 
         print('--- User map area                         :', self.usermap.get_valid_area(degrees=True))
 
@@ -577,18 +588,18 @@ class SkyMaskPipe:
         print('--- Extended map area                     :', self.extendedmap.get_valid_area(degrees=True))
 
 
-    def build_propmap_mask(self, prop_map, threshold, comparison):
+    def build_propmap_mask(self, prop_maps, thresholds, comparisons):
         """
-        Build a HealSparse boolean mask based on a property map threshold
+        Build a HealSparse boolean mask based on multiple property map thresholds
 
         Parameters
         ----------
-        prop_map : HealSparseMap
-            The survey property map to threshold
-        threshold : float
-            Numeric threshold value
-        comparison : {'gt', 'lt', 'ge', 'le'}
-            Comparison operator
+        prop_maps : HealSparseMap or list of HealSparseMap
+            One or more survey property maps to threshold
+        thresholds : float or list of float
+            Threshold value(s) for each property map
+        comparisons : str or list of {'gt', 'lt', 'ge', 'le'}
+            Comparison operator(s) for each threshold
 
         Returns
         -------
@@ -596,74 +607,58 @@ class SkyMaskPipe:
             Healsparse boolean map
         """
 
+        # Normalize inputs to lists
+        if not isinstance(prop_maps, (list, tuple)):
+            prop_maps = [prop_maps]
+        if not isinstance(thresholds, (list, tuple)):
+            thresholds = [thresholds]
+        if not isinstance(comparisons, (list, tuple)):
+            comparisons = [comparisons]
+
+        if not (len(prop_maps) == len(thresholds) == len(comparisons)):
+            raise ValueError("prop_maps, thresholds, and comparisons must be of the same length")
+
+        # Verify that all maps have the same resolution
+        cov_res_set = {pm.nside_coverage for pm in prop_maps}
+        sparse_res_set = {pm.nside_sparse for pm in prop_maps}
+
+        if len(cov_res_set) != 1 or len(sparse_res_set) != 1:
+            raise ValueError("All input property maps must have the same nside_coverage and nside_sparse")
+
+
         ops = {
-            'gt': lambda v: v > threshold,
-            'ge': lambda v: v >= threshold,
-            'lt': lambda v: v < threshold,
-            'le': lambda v: v <= threshold,
+            'gt': lambda v, t: v > t,
+            'ge': lambda v, t: v >= t,
+            'lt': lambda v, t: v < t,
+            'le': lambda v, t: v <= t,
         }
 
-        if comparison not in ops:
-            raise ValueError(f"Invalid comparison: {comparison}")
+        # Start with the pixel set from the first map
+        pixels = prop_maps[0].valid_pixels.copy()
 
-        # Get valid pixels and corresponding values
-        pixels = prop_map.valid_pixels
-        values = prop_map.get_values_pix(pixels)
+        for i, (prop_map, threshold, comparison) in enumerate(zip(prop_maps, thresholds, comparisons)):
+            if comparison not in ops:
+                raise ValueError(f"Invalid comparison: {comparison}")
 
-        # Apply the threshold
-        selected_pixels = pixels[ops[comparison](values)]
+            this_pixels = prop_map.valid_pixels
+            this_values = prop_map.get_values_pix(this_pixels)
 
-        if len(selected_pixels)==0:
-            raise ValueError("0 pixels meeting threshold")
+            # Apply comparison and filter
+            selected = this_pixels[ops[comparison](this_values, threshold)]
 
-        # Build empty boolean mask and set True in selected pixels
-        self.propmap = hsp.HealSparseMap.make_empty(self.nside_cov, prop_map.nside_sparse, dtype=np.bool_)
-        self.propmap[selected_pixels] = True
-        self.order_prop=prop_map.nside_sparse
+            # Intersect with current valid pixel set
+            pixels = np.intersect1d(pixels, selected, assume_unique=True)
+
+            if len(pixels) == 0:
+                raise ValueError(f"0 pixels remaining after condition {i} ({comparison} {threshold})")
+
+        # Build final mask
+        self.propmap = hsp.HealSparseMap.make_empty(self.nside_cov, prop_maps[0].nside_sparse, dtype=np.bool_)
+        self.propmap[pixels] = True
+        self.order_prop = prop_maps[0].nside_sparse
 
         print('--- Property map area                        :', self.propmap.get_valid_area(degrees=True))
 
-
-    def build_pm(self, prop_map: hsp.HealSparseMap, threshold: float,
-                      comparison: str = 'gt') -> hsp.HealSparseMap:
-        """
-        Build a HealSparse boolean mask based on a property map threshold
-
-        Parameters
-        ----------
-        prop_map : HealSparseMap
-            The survey property map to threshold
-        threshold : float
-            Numeric threshold value
-        comparison : {'gt', 'lt', 'ge', 'le'} (default: 'gt')
-            Comparison operator
-
-        Returns
-        -------
-        mask_map : HealSparseMap
-            Healsparse boolean map
-        """
-        ops = {
-            'gt': lambda v: v > threshold,
-            'ge': lambda v: v >= threshold,
-            'lt': lambda v: v < threshold,
-            'le': lambda v: v <= threshold,
-        }
-
-        if comparison not in ops:
-            raise ValueError(f"Invalid comparison: {comparison}")
-
-        # Get valid pixels and corresponding values
-        pixels = prop_map.valid_pixels
-        values = prop_map.get_values_pix(pixels)
-
-        # Apply the threshold
-        selected_pixels = pixels[ops[comparison](values)]
-
-        # Build boolean mask and set True of selected pixels
-        self.patchmap = hsp.HealSparseMap.make_empty(self.nside_cov, prop_map.nside_sparse, dtype=np.bool_)
-        self.patchmap[selected_pixels] = True
-        print('--- Patch map area                        :', self.patchmap.get_valid_area(degrees=True))
 
 
     def build_patch_mask(self, patchfile=None, qafile=None, order_patch=None,
@@ -878,9 +873,18 @@ class SkyMaskPipe:
 
         if apply_usermap:
             if self.usermap:
-                self.mask = self.intersect_boolmask(self.usermap, self.mask)
+                if self.usermap_type == 'positive':
+                    self.mask = self.intersect_boolmask(self.usermap, self.mask)
+                elif self.usermap_type == 'negative':
+                    self.mask = self.mask & (~self.usermap)
             else:
                 raise Exception('usermap not defined')
+
+        #if apply_usermap:
+        #    if self.usermap:
+        #        self.mask = self.intersect_boolmask(self.usermap, self.mask)
+        #    else:
+        #        raise Exception('usermap not defined')
 
         print('--- Combined map area                     :', self.mask.get_valid_area(degrees=True))
 
@@ -1055,6 +1059,7 @@ class SkyMaskPipe:
         """
         if stage == 'foot':        mk = self.foot
         if stage == 'patchmap':    mk = self.patchmap
+        if stage == 'propmap':     mk = self.propmap
         if stage == 'holemap':     mk = self.holemap
         if stage == 'extendedmap': mk = self.extendedmap
         if stage == 'mask':        mk = self.mask
@@ -1091,6 +1096,7 @@ class SkyMaskPipe:
         colra, coldec = columns
         if stage == 'foot':        mk = self.foot
         if stage == 'patchmap':    mk = self.patchmap
+        if stage == 'propmap':     mk = self.propmap
         if stage == 'holemap':     mk = self.holemap
         if stage == 'extendedmap': mk = self.extendedmap
         if stage == 'mask':        mk = self.mask
