@@ -69,6 +69,44 @@ class SkyMaskPipe:
         self.ellip_regs  = None
 
 
+    def __str__(self):
+        # ================================================================
+        # Create a summary of a SkyMaskPipe object that works with print()
+        #================================================================
+        import healpy as hp
+
+        def summarize_stage(name, hsp_map):
+            if hsp_map is None:
+                return f"{name:<15}: Not defined"
+            else:
+                nside_cov = hsp_map.nside_coverage
+                nside_sparse = hsp_map.nside_sparse
+                npix = hsp_map.n_valid
+                area = hsp_map.get_valid_area(degrees=True)
+                pix_area_deg2 = hp.nside2pixarea(nside_sparse, degrees=True)
+                pix_size_arcsec = (pix_area_deg2 ** 0.5) * 3600  # deg2arcsec
+                return (f"{name:<15}: nside_cov={nside_cov:<5}  "
+                        f"nside_sparse={nside_sparse:<5}  "
+                        f"valid_pix={npix:<7}  area={area:6.2f} deg²  "
+                        f"pix_size={pix_size_arcsec:6.1f}\"")
+
+        lines = [
+            summarize_stage("foot", self.foot),
+            summarize_stage("patchmap", self.patchmap),
+            summarize_stage("propmap", self.propmap),
+            summarize_stage("holemap", self.holemap),
+            summarize_stage("extendedmap", self.extendedmap),
+            summarize_stage("usermap", self.usermap),
+            summarize_stage("mask", self.mask)
+        ]
+        return "\n".join(lines)
+
+    # #########################
+    # Uncomment this if you want to display the summary just by typing the name of the pipeline object
+    #__repr__ = __str__
+    ###########################
+
+
     @staticmethod
     def readQApatches(qafile):
         """
@@ -588,14 +626,49 @@ class SkyMaskPipe:
         print('--- Extended map area                     :', self.extendedmap.get_valid_area(degrees=True))
 
 
+    @staticmethod
+    def reproject_nside_coverage(hspmap, newcov):
+        """
+        Change the nside_coverage of a healsparse map. Useful to bring boolean maps to a common coverage,
+        allowing logic combinations between them
+
+        Parameters
+        ----------
+        hsmap
+            Healsparse boolean map
+
+        Returns
+        -------
+        hsmap
+            Healsparse boolean map
+        """
+        oldcov = hspmap.nside_coverage
+        # Get all sparse pixels with valid data
+        ipix = hspmap.valid_pixels
+        values = hspmap.get_values_pix(ipix)
+
+        # Create new map with same nside_sparse, but new coverage resolution
+        new_map = hsp.HealSparseMap.make_empty(
+            nside_coverage=newcov,
+            nside_sparse=hspmap.nside_sparse,
+            dtype=hspmap.dtype
+        )
+
+        # Insert data into the new map
+        new_map.update_values_pix(ipix, values)
+
+        print(f'    Warning: nside_coverage changed from {oldcov} to {newcov}')
+        return new_map
+
+
     def build_propmap_mask(self, prop_maps, thresholds, comparisons):
         """
         Build a HealSparse boolean mask based on multiple property map thresholds
 
         Parameters
         ----------
-        prop_maps : HealSparseMap or list of HealSparseMap
-            One or more survey property maps to threshold
+        prop_maps : list of HealSparseMap or list of str
+            One or more HealSparse maps to threshold, either as objects or file paths
         thresholds : float or list of float
             Threshold value(s) for each property map
         comparisons : str or list of {'gt', 'lt', 'ge', 'le'}
@@ -607,6 +680,11 @@ class SkyMaskPipe:
             Healsparse boolean map
         """
 
+        import os
+        from pathlib import Path
+
+        print('BUILDING PROPERTY MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
+
         # Normalize inputs to lists
         if not isinstance(prop_maps, (list, tuple)):
             prop_maps = [prop_maps]
@@ -617,6 +695,19 @@ class SkyMaskPipe:
 
         if not (len(prop_maps) == len(thresholds) == len(comparisons)):
             raise ValueError("prop_maps, thresholds, and comparisons must be of the same length")
+
+        # Convert file paths to HealSparseMap objects
+        resolved_maps = []
+        for pm in prop_maps:
+            if isinstance(pm, (str, os.PathLike)):               # if isinstance(pm, str):
+                print('--- Processing', str(pm))
+                resolved_maps.append(hsp.HealSparseMap.read(str(pm)))    #resolved_maps.append(hsp.HealSparseMap.read(pm))
+            elif isinstance(pm, hsp.HealSparseMap):
+                resolved_maps.append(pm)
+            else:
+                raise TypeError(f"Each prop_map must be a str (path) or a HealSparseMap instance, not {type(pm)}")
+
+        prop_maps = resolved_maps
 
         # Verify that all maps have the same resolution
         cov_res_set = {pm.nside_coverage for pm in prop_maps}
@@ -652,12 +743,17 @@ class SkyMaskPipe:
             if len(pixels) == 0:
                 raise ValueError(f"0 pixels remaining after condition {i} ({comparison} {threshold})")
 
-        # Build final mask
-        self.propmap = hsp.HealSparseMap.make_empty(self.nside_cov, prop_maps[0].nside_sparse, dtype=np.bool_)
+        # Build final mask prop_maps[0].nside_coverage
+        #self.propmap = hsp.HealSparseMap.make_empty(self.nside_cov, prop_maps[0].nside_sparse, dtype=np.bool_)
+        self.propmap = hsp.HealSparseMap.make_empty(prop_maps[0].nside_coverage, prop_maps[0].nside_sparse, dtype=np.bool_)
         self.propmap[pixels] = True
         self.order_prop = prop_maps[0].nside_sparse
 
-        print('--- Property map area                        :', self.propmap.get_valid_area(degrees=True))
+        # Change nside_coverage if needed
+        if self.nside_cov != prop_maps[0].nside_coverage:
+            self.propmap = self.reproject_nside_coverage(self.propmap, self.nside_cov)
+
+        print('--- Property map area                     :', self.propmap.get_valid_area(degrees=True))
 
 
 
@@ -767,8 +863,7 @@ class SkyMaskPipe:
         print('--- Footprint map area                    :', self.foot.get_valid_area(degrees=True))
 
 
-
-    def combine_mask(self, apply_patchmap=True, apply_propmap=True, apply_holemap=True,
+    def combine_mask(self, apply_patchmap=True, apply_propmap=False, apply_holemap=True,
                      apply_extendedmap=True, apply_usermap=False):
         """
         Combine a footprint map with **4 (optional) masks**:
