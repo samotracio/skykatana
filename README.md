@@ -22,7 +22,7 @@ Main Class
 
 Main Methods
 -------------
-* ``build_footprint_mask(), build_patch_mask(), build_holes_mask(), etc``
+* ``build_footprint_mask(), build_patch_mask(), build_holes_mask(), buld_propmap_mask(), etc``
     --> Generate maps for each stage
 * ``combine_mask()``
     --> Merge the maps created above to generate a final mask
@@ -38,14 +38,19 @@ Main Methods
 Dependencies
 ------------
 * [lsdb](https://github.com/astronomy-commons/lsdb), [healsparse](https://github.com/LSSTDESC/healsparse),
-[tqdm](https://github.com/tqdm/tqdm)
+[tqdm](https://github.com/tqdm/tqdm), [healpy](https://github.com/healpy/healpy)
 
 Install
 -------
 There are two ways to get skykatana:
 1. `pip install skykatana`
 2. Clone the repo, switch to the pacakge directory and do `pip install .` . This has the advantage that you will
-get the latest version and all the files in /example_data (~210 MB)
+get the latest version and example notebooks.
+
+Example Dataset
+---------------
+There a small dataset of ~8 million HSC sources to start using the package. Get it [here](https://drive.google.com/file/d/1Fft9E9uD1eXs-8Dxb8bp5ou1bEtCTkgr/view?usp=sharing) 
+(170 MB) and decompress it. Then, adjust the folder location in the provided notebooks and just run them. 
 
 Documentation
 -------------
