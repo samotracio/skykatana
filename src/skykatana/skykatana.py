@@ -9,7 +9,7 @@ from mocpy import MOC
 from tqdm import tqdm
 import re
 import pickle
-
+import pandas as pd
 
 
 class SkyMaskPipe:
@@ -59,7 +59,7 @@ class SkyMaskPipe:
         self.usermap     = None
         self.extendedmap = None
         self.mask        = None
-        self.hatscat     = None
+        self.sources     = None
         self.qafile      = None
         self.patchfile   = None
         self.star_regs   = None
@@ -102,7 +102,7 @@ class SkyMaskPipe:
         return "\n".join(lines)
 
     # #########################
-    # Uncomment this if you want to display the summary just by typing the name of the pipeline object
+    # Uncomment this if you want to display the summary just by typing the name of the object
     #__repr__ = __str__
     ###########################
 
@@ -807,24 +807,24 @@ class SkyMaskPipe:
 
 
 
-    def build_footprint_mask(self, hatscat=None, order_foot=None, columns=['ra','dec'],
-                             remove_isopixels=False, erode_borders=False):
+
+    def build_footprint_mask(self, sources, order_foot=None, columns=['ra','dec'],
+                            remove_isopixels=False, erode_borders=False):
         """
-        Create a footprint map of a source catalog, pixelated at a given order. Optionally remove isolated
-        empty pixels and erode borders around empty zones. For details see remove_isopixels() and erode_borders()
+        Create a footprint map of a source catalog (from any astropy-supported table or HATS), pixelated at a given order.
 
         Parameters
         ----------
-        hatscat : str
-            Path to catalog (HATS directory)
+        sources : str, astropy.table.Table, pandas.DataFrame, or HATS catalog
+            Input catalog or path to catalog (any format supported by astropy or lsdb.read_hats for HATS)
         order_foot : int
             Pixelization order
-        remove_isopixels : bool
-            Remove isolated (empty) pixels surrounded by 8 non-empty pixels
-        erode_borders : bool
-            Detect and remove border pixels around holes
         columns : list of str
             Columns for ra, dec
+        remove_isopixels : bool
+            Remove isolated (empty) pixels
+        erode_borders : bool
+            Detect and remove border pixels
 
         Returns
         -------
@@ -832,20 +832,37 @@ class SkyMaskPipe:
             Healsparse boolean map
         """
 
-        if hatscat: self.hatscat=hatscat
-        if columns: self.hatscat_columns=columns
-        if order_foot: self.order_foot=order_foot
+        if order_foot: self.order_foot = order_foot
         colra, coldec = columns
         print('BUILDING FOOTPRINT MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
 
-        # Create empty healsparse empty
-        nside_foot   = 2**self.order_foot
+        # Create empty healsparse map
+        nside_foot = 2**self.order_foot
         self.foot = hsp.HealSparseMap.make_empty(self.nside_cov, nside_foot, dtype=np.bool_)
 
-        # Read (ra,dec) from a HATS catalog
-        print('--- Pixelating HATS catalog from:', self.hatscat)
+        # Read sources: dispatch based on input type
+        srcs = None
+        if isinstance(sources, str):
+            # Try HATS first, fallback to astropy.table.Table.read
+            try:
+                import lsdb
+                srcs = lsdb.read_hats(sources, columns=columns).compute()
+                self.sources = sources    # store the path
+                print('--- Pixelating HATS catalog from:', self.sources)
+            except Exception:
+                srcs = Table.read(sources)
+                self.sources = sources    # store the path
+                print('--- Pixelating sources from:', self.sources)
+        elif isinstance(sources, Table):
+            srcs = sources
+            print('--- Pixelating sources')
+        elif isinstance(sources, pd.DataFrame):
+            srcs = Table.from_pandas(sources)
+            print('--- Pixelating sources')
+        else:
+            raise ValueError("sources must be a path, astropy.table.Table, or pandas.DataFrame")
+
         print('    Order ::',self.order_foot)
-        srcs = lsdb.read_hats(self.hatscat, columns=columns).compute()
 
         # Get pixel number for each object
         pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True)
@@ -853,7 +870,7 @@ class SkyMaskPipe:
         # Update map values for pixels that have objects
         self.foot.update_values_pix(pixels, np.full_like(pixels, True, dtype=np.bool_), operation='or')
 
-        # Remove isolated empty pixels and borders aound holes, if requested
+        # Remove isolated empty pixels and borders around holes, if requested
         if remove_isopixels:
             self.foot = self.remove_isopixels(self.foot)
 
@@ -861,6 +878,7 @@ class SkyMaskPipe:
             self.foot = self.erode_borders(self.foot)
 
         print('--- Footprint map area                    :', self.foot.get_valid_area(degrees=True))
+
 
 
     def combine_mask(self, apply_patchmap=True, apply_propmap=False, apply_holemap=True,
@@ -1011,15 +1029,16 @@ class SkyMaskPipe:
         return msk
 
 
+
     def plot(self, stage='mask', nr=50_000, s=0.5, figsize=[12,6], xwin=None, ywin=None,
-             plot_stars=False, plot_boxes=False, use_srcs=False, ax=None, **kwargs):
+            plot_stars=False, plot_boxes=False, use_srcs=False, sources=None, columns=['ra','dec'], ax=None, **kwargs):
         """
-        Visualize a mask by means of its randoms points
+        Visualize a mask stage or the input sources.
 
         Parameters
         ----------
-        stage : string
-            Masking stage to use, e.g. 'mask', 'foot', 'holemap', etc.
+        stage : str
+            The mask stage to plot.
         nr : integer
             Number of randoms
         s : float
@@ -1035,7 +1054,11 @@ class SkyMaskPipe:
         plot_boxes : bool
             Overlay boxes due to bright stars
         use_srcs : bool
-            Plot input sources used to build the footprint map, instead of random points. Note this means that no mask of any kind is actually plotted
+            Plot input sources instead of randoms. Note this means no mask of any kind is actually plotted. Uses `sources` argument.
+        sources : str, astropy.table.Table or pandas.DataFrame, optional
+            The input sources to plot. If None, will try to use self.sources which holds the file path when the footprint mask was created from on disk catalog.
+        columns : list of str
+            Columns for RA, Dec.
         ax : axes
             If given, plot will be added to the axes object provided
         kwargs : [key=val]
@@ -1046,17 +1069,39 @@ class SkyMaskPipe:
         if stage == 'propmap':     mk = self.propmap
         if stage == 'holemap':     mk = self.holemap
         if stage == 'extendedmap': mk = self.extendedmap
-        if stage == 'usermap':     mk = self.usermap
         if stage == 'mask':        mk = self.mask
+        if stage == 'usermap':     mk = self.usermap
+
+        colra, coldec = columns
 
         if use_srcs:
-            # Use catalog for scatter plot
-            srcs = lsdb.read_hats(self.hatscat, columns=self.hatscat_columns).compute()
-            xx, yy = srcs[self.hatscat_columns[0]], srcs[self.hatscat_columns[1]]
+            # Fallbacks for sources argument to preserve compatibility
+            if sources is None:
+                if hasattr(self, 'sources'):
+                    sources = self.sources
+                else:
+                    raise ValueError("No input sources provided for use_srcs=True.")
+
+            srcs = None
+            if isinstance(sources, str):
+                # Try HATS first, fallback to astropy.table.Table.read
+                try:
+                    import lsdb
+                    srcs = lsdb.read_hats(sources, columns=columns).compute()
+                except Exception:
+                    srcs = Table.read(sources)
+            elif isinstance(sources, Table):
+                srcs = sources
+            elif isinstance(sources, pd.DataFrame):
+                srcs = Table.from_pandas(sources)
+            else:
+                raise ValueError("sources must be a path, astropy.table.Table, or pandas.DataFrame")
+
+            xx, yy = srcs[colra], srcs[coldec]
             stage = 'sources'
         else:
-             # Use randoms for scatter plot
-             xx, yy = hsp.make_uniform_randoms_fast(mk, nr)
+            # Use randoms for scatter plot
+            xx, yy = hsp.make_uniform_randoms_fast(mk, nr)
 
         # Do plot ------------------------------------------
         if not(ax): fig, ax = plt.subplots(figsize=figsize)
@@ -1096,9 +1141,8 @@ class SkyMaskPipe:
         #if not(ax): plt.show()
 
 
-
     def plot2compare(self, stage='mask', nr=50_000, s=0.5, figsize=[12,6], xwin=None, ywin=None,
-                     plot_stars=False, plot_boxes=False, **kwargs):
+                     plot_stars=False, plot_boxes=False, sources=None, columns=['ra','dec'], **kwargs):
         """
         Compare input sources and random points generate over a mask
 
@@ -1120,13 +1164,17 @@ class SkyMaskPipe:
             Overlay circles due to bright stars
         plot_boxes : bool
             Overlay boxes due to bright stars
+        sources : str, astropy.table.Table or pandas.DataFrame, optional
+            The input sources to plot. If None, will try to use self.sources which holds the file path when the footprint mask was created from on disk catalog.
+        columns : list of str
+            Columns for RA, Dec.
         kwargs : [key=val]
             Adittional keyword arguments passed to mataplolib.scatter()
         """
         fig, (ax1, ax2) = plt.subplots(1,2, figsize=figsize)
 
         self.plot(stage=stage, nr=nr, s=s, figsize=[figsize[0]*0.5, figsize[1]], xwin=xwin, ywin=ywin,
-                  plot_stars=plot_stars, plot_boxes=plot_boxes, use_srcs=True, ax=ax1 ,**kwargs)
+                  plot_stars=plot_stars, plot_boxes=plot_boxes, use_srcs=True, sources=sources, columns=columns, ax=ax1 ,**kwargs)
 
         self.plot(stage=stage, nr=nr, s=s, figsize=[figsize[0]*0.5, figsize[1]], xwin=xwin, ywin=ywin,
                   plot_stars=plot_stars, plot_boxes=plot_boxes, use_srcs=False, ax=ax2, **kwargs)
