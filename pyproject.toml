@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "skykatana"
-version = "0.1.3"
+version = "0.1.4"
 description = "Tookit to create sky masks in a pipeline way"
 readme = "README.md"
 authors = [{ name = "Emilio Donoso, ICATE-Conicet", email = "emiliodon@gmail.com" }]
@@ -17,7 +17,7 @@ classifiers = [
     "Programming Language :: Python :: 3"]
 keywords = ["Astronomy", "Surveys", "Sky Masks"]
 
-dependencies = [ "lsdb", "healsparse", "tqdm"]
+dependencies = [ "lsdb", "healsparse", "tqdm", "healpy"]
 
 requires-python = ">=3.10"
 
