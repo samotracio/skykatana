@@ -508,6 +508,8 @@ class SkyMaskPipe:
         """
         print('BUILDING BRIGHT STAR HOLES MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
 
+        if order_holes: self.order_holes=order_holes
+
         if star_regs:
             self.star_regs=star_regs
             self.star_regs_fmt = fmt
@@ -912,6 +914,13 @@ class SkyMaskPipe:
                 print('--- patchmap order upgraded to: ', self.order_out)
                 self.patchmap = self.patchmap.upgrade(self.nside_out)
                 self.order_patch = self.order_out
+
+        if apply_holemap and self.holemap:
+            otmp = int(np.log2(self.holemap.nside_sparse))
+            if otmp < self.order_out:
+                print('--- holemap order upgraded to: ', self.order_out)
+                self.holemap = self.holemap.upgrade(self.nside_out)
+                self.order_holes = self.order_out
 
         if apply_propmap and self.propmap:
             otmp = int(np.log2(self.propmap.nside_sparse))
