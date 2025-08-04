@@ -866,91 +866,118 @@ class SkyMaskPipe:
 
 
     def combine_mask(self, apply_patchmap=True, apply_propmap=False, apply_holemap=True,
-                     apply_extendedmap=True, apply_usermap=False):
+                    apply_extendedmap=True, apply_usermap=False, footprint_override=None):
         """
-        Combine a footprint map with **4 (optional) masks**:
-
-        1) A patch map containing valid patches
-
-        2) A property map containing valid pixels meeting a given threshold of a certain property
-
-        3) A holes map due to bright stars/boxes
-
-        4) A holes map due to extended sources
-
-        5) A user defined map of arbitrary regions
+        Combine a footprint map with optional masks.
 
         Parameters
         ----------
         apply_patchmap : bool
-            Apply patch map of accepted patches
+            Apply patch map of accepted patches.
         apply_propmap : bool
-            Apply property map of accepted pixels
+            Apply property map of accepted pixels.
         apply_holemap : bool
-            Apply holes map due to bright stars and boxes
+            Apply holes map due to bright stars and boxes.
         apply_extendedmap : bool
-            Apply holes map due to extended sources
+            Apply holes map due to extended sources.
         apply_usermap : bool
-            Apply map of user defined regions
+            Apply user-defined region mask.
+        footprint_override : HealSparseMap, optional
+            Use this instead of the default footprint map.
 
         Returns
         -------
         hsp_map
-            Healsparse boolean map
+            Final combined boolean HealSparseMap mask.
         """
 
         print('COMBINING MAPS >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
 
-        # Upgrade maps if needed up to the desired resolution
-        otmp = int(np.log2(self.foot.nside_sparse))
-        if otmp < self.order_out:
-            print('--- footprint order upgraded to:', self.order_out)
-            self.foot = self.foot.upgrade(self.nside_out)
-            self.order_foot = self.order_out
+        # Choose base map
+        base_map = footprint_override or self.foot
 
+        # Validate disallowed overrides
+        if footprint_override is self.holemap:
+            raise ValueError("Cannot use holemap as footprint_override (negative area).")
+
+        if footprint_override is self.usermap and getattr(self, 'usermap_type', None) == 'negative':
+            raise ValueError("Cannot use negative usermap as footprint_override (negative area).")
+
+        # Skip any maps that are used as the override
+        if footprint_override is self.patchmap:
+            if apply_patchmap:
+                print('--- footprint_override is patchmap: skipping patchmap')
+            apply_patchmap = False
+
+        if footprint_override is self.propmap:
+            if apply_propmap:
+                print('--- footprint_override is propmap: skipping propmap')
+            apply_propmap = False
+
+        if footprint_override is self.extendedmap:
+            if apply_extendedmap:
+                print('--- footprint_override is extendedmap: skipping extendedmap')
+            apply_extendedmap = False
+
+        if footprint_override is self.usermap:
+            if apply_usermap:
+                print('--- footprint_override is usermap: skipping usermap')
+            apply_usermap = False
+
+        # Upgrade base map if needed
+        otmp = int(np.log2(base_map.nside_sparse))
+        if otmp < self.order_out:
+            print('--- base map upgraded to:', self.order_out)
+            base_map = base_map.upgrade(self.nside_out)
+
+        if footprint_override is not None:
+            self.foot_override = base_map
+
+        self.order_foot = self.order_out
+
+        # Upgrade other maps if needed
         if apply_patchmap and self.patchmap:
             otmp = int(np.log2(self.patchmap.nside_sparse))
             if otmp < self.order_out:
-                print('--- patchmap order upgraded to: ', self.order_out)
+                print('--- patchmap order upgraded to:', self.order_out)
                 self.patchmap = self.patchmap.upgrade(self.nside_out)
                 self.order_patch = self.order_out
 
         if apply_holemap and self.holemap:
             otmp = int(np.log2(self.holemap.nside_sparse))
             if otmp < self.order_out:
-                print('--- holemap order upgraded to: ', self.order_out)
+                print('--- holemap order upgraded to:', self.order_out)
                 self.holemap = self.holemap.upgrade(self.nside_out)
                 self.order_holes = self.order_out
 
         if apply_propmap and self.propmap:
             otmp = int(np.log2(self.propmap.nside_sparse))
             if otmp < self.order_out:
-                print('--- propmap order upgraded to: ', self.order_out)
+                print('--- propmap order upgraded to:', self.order_out)
                 self.propmap = self.propmap.upgrade(self.nside_out)
                 self.order_prop = self.order_out
 
         if apply_usermap and self.usermap:
             otmp = int(np.log2(self.usermap.nside_sparse))
             if otmp < self.order_out:
-                print('--- usermap order upgraded to: ', self.order_out)
+                print('--- usermap order upgraded to:', self.order_out)
                 self.usermap = self.usermap.upgrade(self.nside_out)
                 self.order_user = self.order_out
 
         if apply_extendedmap and self.extendedmap:
             otmp = int(np.log2(self.extendedmap.nside_sparse))
             if otmp < self.order_out:
-                print('--- extendedmap order upgraded to: ', self.order_out)
+                print('--- extendedmap order upgraded to:', self.order_out)
                 self.extendedmap = self.extendedmap.upgrade(self.nside_out)
                 self.order_extended = self.order_out
 
-        # Create empty map to contain the final mask and perform combination
+        # Create empty mask
         self.mask = hsp.HealSparseMap.make_empty(self.nside_cov, self.nside_out, dtype=np.bool_)
 
-        # Start from footprint map
-        self.mask |= self.foot
-        # Should we consider an anternative flow with no footmap, and starting from
-        # the usermap?
+        # Start from base map
+        self.mask |= base_map
 
+        # Combine stages
         if apply_patchmap:
             if self.patchmap:
                 self.mask = self.intersect_boolmask(self.patchmap, self.mask)
@@ -983,12 +1010,6 @@ class SkyMaskPipe:
                     self.mask = self.mask & (~self.usermap)
             else:
                 raise Exception('usermap not defined')
-
-        #if apply_usermap:
-        #    if self.usermap:
-        #        self.mask = self.intersect_boolmask(self.usermap, self.mask)
-        #    else:
-        #        raise Exception('usermap not defined')
 
         print('--- Combined map area                     :', self.mask.get_valid_area(degrees=True))
 
