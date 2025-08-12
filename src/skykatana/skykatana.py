@@ -507,7 +507,7 @@ class SkyMaskPipe:
         hsp_map
             Healsparse boolean map
         """
-        print('BUILDING BRIGHT STAR HOLES MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
+        print('BUILDING BRIGHT STAR HOLES MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
 
         if order_holes: self.order_holes=order_holes
 
@@ -811,7 +811,7 @@ class SkyMaskPipe:
 
 
     def build_footprint_mask(self, sources, order_foot=None, columns=['ra','dec'],
-                             remove_isopixels=False, erode_borders=False):
+                             remove_isopixels=False, erode_borders=False, mapping=False):
         """
         Create a footprint map of a source catalog (from any astropy-supported table or HATS),
         pixelated at a given order. Optionally remove isolated empty pixels and erode borders
@@ -823,18 +823,33 @@ class SkyMaskPipe:
             Input catalog or path to catalog (any format supported by astropy or lsdb.read_hats for HATS)
         order_foot : int
             Pixelization order
+        columns : list of str
+            Columns for ra, dec
         remove_isopixels : bool
             Remove isolated (empty) pixels surrounded by 8 non-empty pixels
         erode_borders : bool
             Detect and remove border pixels around holes
-        columns : list of str
-            Columns for ra, dec
+        mapping : bool
+            If True, distribute pixelization across HATS partitions. A Dask cluster must be running
 
         Returns
         -------
         hsp_map
             Healsparse boolean map
         """
+
+        def footpartition(df, pixel, order_foot=15, order_cov=6, columns=['ra','dec']):
+            # Returns a df with the list of pixels of the input df
+            nside_foot   = 2**order_foot
+            nside_cov    = 2**order_cov
+            foot = hsp.HealSparseMap.make_empty(nside_cov, nside_foot, dtype=np.bool_)
+            pixels = hp.ang2pix(nside_foot, df[columns[0]], df[columns[1]], nest=True, lonlat=True)
+            foot.update_values_pix(pixels, np.full_like(pixels, True, dtype=np.bool_), operation='or')
+            outdf = pd.DataFrame(foot.valid_pixels, columns=['pxs'])
+            return outdf
+
+        metafootpartition = pd.DataFrame([{"pxs": 0}])
+
 
         if order_foot: self.order_foot = order_foot
         colra, coldec = columns
@@ -844,32 +859,36 @@ class SkyMaskPipe:
         nside_foot = 2**self.order_foot
         self.foot = hsp.HealSparseMap.make_empty(self.nside_cov, nside_foot, dtype=np.bool_)
 
-        # Read sources: dispatch based on input type
+        # Read sources and pixelize based on input type
         srcs = None
-        if isinstance(sources, str):
-            # Try HATS first, fallback to astropy.table.Table.read
-            try:
-                import lsdb
-                srcs = lsdb.read_hats(sources, columns=columns).compute()
-                self.sources = sources    # store the path
-                print('--- Pixelating HATS catalog from:', self.sources)
-            except Exception:
-                srcs = Table.read(sources)
-                self.sources = sources    # store the path
-                print('--- Pixelating sources from:', self.sources)
-        elif isinstance(sources, Table):
+        if str(sources.__class__) == "<class 'lsdb.catalog.catalog.Catalog'>" :
+            print('--- Pixelating HATS catalog')
+            import lsdb
             srcs = sources
+            if mapping:
+                print(f"    Partitions for mapping: {srcs.npartitions:<7}")
+                pixdf = srcs.map_partitions(footpartition, include_pixel=True, meta=metafootpartition,
+                                            order_foot=self.order_foot, order_cov=self.order_cov, columns=columns).compute()
+                pixels = np.array(pixdf['pxs'].values)
+            else:
+                srcs = srcs[columns].compute()
+                pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True) # get pixel nr for each object
+        elif isinstance(sources, Table):
             print('--- Pixelating sources')
+            srcs = sources
+            pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True) # get pixel nr for each object
         elif isinstance(sources, pd.DataFrame):
-            srcs = Table.from_pandas(sources)
             print('--- Pixelating sources')
+            srcs = Table.from_pandas(sources)
+            pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True) # get pixel nr for each object
+        elif isinstance(sources, str):
+            print('--- Pixelating sources from:', sources)
+            srcs = Table.read(sources)
+            pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True) # get pixel nr for each object
         else:
-            raise ValueError("sources must be a path, astropy.table.Table, or pandas.DataFrame")
+            raise ValueError("sources must be a str, astropy.table.Table, or pandas.DataFrame")
 
         print('    Order ::',self.order_foot)
-
-        # Get pixel number for each object
-        pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True)
 
         # Update map values for pixels that have objects
         self.foot.update_values_pix(pixels, np.full_like(pixels, True, dtype=np.bool_), operation='or')
@@ -882,6 +901,187 @@ class SkyMaskPipe:
             self.foot = self.erode_borders(self.foot)
 
         print('--- Footprint map area                    :', self.foot.get_valid_area(degrees=True))
+
+
+    # def build_footprint_mask(self, sources, order_foot=None, columns=['ra','dec'],
+    #                          remove_isopixels=False, erode_borders=False, mapping=False):
+    #     """
+    #     Create a footprint map of a source catalog (from any astropy-supported table or HATS),
+    #     pixelated at a given order. Optionally remove isolated empty pixels and erode borders
+    #     around empty zones. For details see remove_isopixels() and erode_borders()
+    #
+    #     Parameters
+    #     ----------
+    #     sources : str, astropy.table.Table, pandas.DataFrame, or HATS catalog
+    #         Input catalog or path to catalog (any format supported by astropy or lsdb.read_hats for HATS)
+    #     order_foot : int
+    #         Pixelization order
+    #     remove_isopixels : bool
+    #         Remove isolated (empty) pixels surrounded by 8 non-empty pixels
+    #     erode_borders : bool
+    #         Detect and remove border pixels around holes
+    #     columns : list of str
+    #         Columns for ra, dec
+    #
+    #     Returns
+    #     -------
+    #     hsp_map
+    #         Healsparse boolean map
+    #     """
+    #
+    #     def footpartition(df, pixel, order_foot=15, order_cov=6, columns=['ra','dec']):
+    #         # Returns the df with the list of pixels of the footprint
+    #         nside_foot   = 2**order_foot
+    #         nside_cov    = 2**order_cov
+    #         foot = hsp.HealSparseMap.make_empty(nside_cov, nside_foot, dtype=np.bool_)
+    #         pixels = hp.ang2pix(nside_foot, df[columns[0]], df[columns[1]], nest=True, lonlat=True)
+    #         foot.update_values_pix(pixels, np.full_like(pixels, True, dtype=np.bool_), operation='or')
+    #         outdf = pd.DataFrame(foot.valid_pixels, columns=['pxs'])
+    #         return outdf
+    #
+    #     metafootpartition = pd.DataFrame(
+    #         [{
+    #             "pxs": 0,
+    #         }])
+    #
+    #     if order_foot: self.order_foot = order_foot
+    #     colra, coldec = columns
+    #     print('BUILDING FOOTPRINT MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
+    #
+    #     # Create empty healsparse foot
+    #     nside_foot = 2**self.order_foot
+    #     self.foot = hsp.HealSparseMap.make_empty(self.nside_cov, nside_foot, dtype=np.bool_)
+    #
+    #     import lsdb
+    #
+    #     # Read sources: dispatch based on input type
+    #     srcs = None
+    #     locstring = '[argument]'
+    #     if isinstance(sources, str) or isinstance(sources, lsdb.catalog.catalog.Catalog):
+    #         # Try HATS first, fallback to astropy.table.Table.read
+    #         try:
+    #             if mapping:
+    #                 cat = sources
+    #                 if isinstance(sources, str):
+    #                     cat = lsdb.open_catalog(sources)
+    #                     locstring = sources
+    #                 print('--- Pixelating HATS catalog from:', locstring)
+    #                 print('    Partitions for mapping:', cat.npartitions)
+    #                 pixdf = cat.map_partitions(footpartition, include_pixel=True, meta=metafootpartition,
+    #                                            order_foot=self.order_foot, order_cov=self.order_cov, columns=columns).compute()
+    #                 pixels = np.array(pixdf['pxs'].values)
+    #                 self.sources = sources    # store the path
+    #             else:
+    #                 print('--- Pixelating HATS catalog from:', locstring)
+    #                 srcs = lsdb.read_hats(sources, columns=columns).compute()
+    #                 # Get pixel number for each object
+    #                 pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True)
+    #                 self.sources = sources    # store the path
+    #         except Exception:
+    #             srcs = Table.read(sources)
+    #             self.sources = sources    # store the path
+    #             print('--- Pixelating sources from:', self.sources)
+    #             # Get pixel number for each object
+    #             pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True)
+    #     elif isinstance(sources, Table):
+    #         print('--- Pixelating sources')
+    #         srcs = sources
+    #         # Get pixel number for each object
+    #         pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True)
+    #     elif isinstance(sources, pd.DataFrame):
+    #         print('--- Pixelating sources')
+    #         srcs = Table.from_pandas(sources)
+    #         pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True)
+    #     else:
+    #         raise ValueError("sources must be a path, astropy.table.Table, or pandas.DataFrame")
+    #
+    #     print('    Order ::',self.order_foot)
+    #
+    #     # Update map values for pixels that have objects
+    #     self.foot.update_values_pix(pixels, np.full_like(pixels, True, dtype=np.bool_), operation='or')
+    #
+    #     # Remove isolated empty pixels and borders around holes, if requested
+    #     if remove_isopixels:
+    #         self.foot = self.remove_isopixels(self.foot)
+    #
+    #     if erode_borders:
+    #         self.foot = self.erode_borders(self.foot)
+    #
+    #     print('--- Footprint map area                    :', self.foot.get_valid_area(degrees=True))
+
+
+    # def BAKBAKbuild_footprint_mask(self, sources, order_foot=None, columns=['ra','dec'],
+    #                          remove_isopixels=False, erode_borders=False):
+    #     """
+    #     Create a footprint map of a source catalog (from any astropy-supported table or HATS),
+    #     pixelated at a given order. Optionally remove isolated empty pixels and erode borders
+    #     around empty zones. For details see remove_isopixels() and erode_borders()
+    #
+    #     Parameters
+    #     ----------
+    #     sources : str, astropy.table.Table, pandas.DataFrame, or HATS catalog
+    #         Input catalog or path to catalog (any format supported by astropy or lsdb.read_hats for HATS)
+    #     order_foot : int
+    #         Pixelization order
+    #     remove_isopixels : bool
+    #         Remove isolated (empty) pixels surrounded by 8 non-empty pixels
+    #     erode_borders : bool
+    #         Detect and remove border pixels around holes
+    #     columns : list of str
+    #         Columns for ra, dec
+    #
+    #     Returns
+    #     -------
+    #     hsp_map
+    #         Healsparse boolean map
+    #     """
+    #
+    #     if order_foot: self.order_foot = order_foot
+    #     colra, coldec = columns
+    #     print('BUILDING FOOTPRINT MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
+    #
+    #     # Create empty healsparse foot
+    #     nside_foot = 2**self.order_foot
+    #     self.foot = hsp.HealSparseMap.make_empty(self.nside_cov, nside_foot, dtype=np.bool_)
+    #
+    #     # Read sources: dispatch based on input type
+    #     srcs = None
+    #     if isinstance(sources, str):
+    #         # Try HATS first, fallback to astropy.table.Table.read
+    #         try:
+    #             import lsdb
+    #             srcs = lsdb.read_hats(sources, columns=columns).compute()
+    #             self.sources = sources    # store the path
+    #             print('--- Pixelating HATS catalog from:', self.sources)
+    #         except Exception:
+    #             srcs = Table.read(sources)
+    #             self.sources = sources    # store the path
+    #             print('--- Pixelating sources from:', self.sources)
+    #     elif isinstance(sources, Table):
+    #         srcs = sources
+    #         print('--- Pixelating sources')
+    #     elif isinstance(sources, pd.DataFrame):
+    #         srcs = Table.from_pandas(sources)
+    #         print('--- Pixelating sources')
+    #     else:
+    #         raise ValueError("sources must be a path, astropy.table.Table, or pandas.DataFrame")
+    #
+    #     print('    Order ::',self.order_foot)
+    #
+    #     # Get pixel number for each object
+    #     pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True)
+    #
+    #     # Update map values for pixels that have objects
+    #     self.foot.update_values_pix(pixels, np.full_like(pixels, True, dtype=np.bool_), operation='or')
+    #
+    #     # Remove isolated empty pixels and borders around holes, if requested
+    #     if remove_isopixels:
+    #         self.foot = self.remove_isopixels(self.foot)
+    #
+    #     if erode_borders:
+    #         self.foot = self.erode_borders(self.foot)
+    #
+    #     print('--- Footprint map area                    :', self.foot.get_valid_area(degrees=True))
 
 
     def combine_mask(self, apply_patchmap=True, apply_propmap=False, apply_holemap=True,
@@ -916,7 +1116,7 @@ class SkyMaskPipe:
         base_map = footprint_override or self.foot
 
         # Validate disallowed overrides
-        if footprint_override is self.holemap:
+        if (footprint_override is self.holemap) and (self.holemap is not(None)):
             raise ValueError("Cannot use holemap as footprint_override (negative area).")
 
         if footprint_override is self.usermap and getattr(self, 'usermap_type', None) == 'negative':
@@ -1065,7 +1265,7 @@ class SkyMaskPipe:
             plot_stars=False, plot_boxes=False, use_srcs=False, sources=None, columns=['ra','dec'],
             ax=None, **kwargs):
         """
-        Visualize a mask stage by means of randoms points. Optinally plot input sources
+        Visualize a mask stage by means of randoms points. Optionally plot input sources
 
         Parameters
         ----------
@@ -1177,7 +1377,7 @@ class SkyMaskPipe:
     def plot2compare(self, stage='mask', nr=50_000, s=0.5, figsize=[12,6], xwin=None, ywin=None,
                      plot_stars=False, plot_boxes=False, sources=None, columns=['ra','dec'], **kwargs):
         """
-        Compare input sources and random points generate over a mask
+        Compare input sources and random points generated over a mask
 
         Parameters
         ----------
