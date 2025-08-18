@@ -5,12 +5,12 @@ import matplotlib.pyplot as plt
 import lsdb
 from astropy.table import Table, join
 from astropy.coordinates import Angle, Latitude, Longitude, SkyCoord
-from mocpy import MOC
+import astropy.units as u
+from mocpy import MOC, WCS
 from tqdm import tqdm
 import re
 import pickle
 import pandas as pd
-
 
 
 class SkyMaskPipe:
@@ -414,7 +414,7 @@ class SkyMaskPipe:
         b = np.where(width_larger, 0.5 * height, 0.5 * width)
         angle = np.where(width_larger, Angle(90, 'deg'), 0)
 
-        # Boxes seem to strech at high declination. For now, multiply by cos(dec) #######
+        # Boxes strech at high declination. For now, multiply by cos(dec) #######
         a = a*np.cos(table[coldec].value*np.pi/180.)
 
         mocs = MOC.from_boxes(
@@ -1262,10 +1262,13 @@ class SkyMaskPipe:
 
 
     def plot(self, stage='mask', nr=50_000, s=0.5, figsize=[12,6], xwin=None, ywin=None,
-            plot_stars=False, plot_boxes=False, use_srcs=False, sources=None, columns=['ra','dec'],
-            ax=None, **kwargs):
+            plot_stars=False, plot_boxes=False, ax=None, **kwargs):
         """
-        Visualize a mask stage by means of randoms points. Optionally plot input sources
+        Quickly visualize a mask stage by means of randoms points in an x-y plot (no WCS projection).
+        Optionally plot circles and boxes to inspect areas masked by stars. If you need more precise
+        sky plots, use plot_moc() and plot_srcs()
+
+        Note boxes shoud not cross the 360/0 boundary
 
         Parameters
         ----------
@@ -1285,55 +1288,17 @@ class SkyMaskPipe:
             Overlay circles due to bright stars
         plot_boxes : bool
             Overlay boxes due to bright stars
-        use_srcs : bool
-            Instead of random points, plot input sources used to build the footprint map. Note this means that no mask of any kind is actually plotted
-        sources : str, astropy.table.Table or pandas.DataFrame
-            The input sources to plot. If None, will try to use self.sources which holds the file path when the footprint mask was created from catalog on disk.
-        columns : list of str
-            Columns for RA and DEC
         ax : axes
             If given, plot will be added to the axes object provided
         kwargs : [key=val]
             Adittional keyword arguments passed to mataplolib.scatter()
         """
-        if stage == 'foot':        mk = self.foot
-        if stage == 'patchmap':    mk = self.patchmap
-        if stage == 'propmap':     mk = self.propmap
-        if stage == 'holemap':     mk = self.holemap
-        if stage == 'extendedmap': mk = self.extendedmap
-        if stage == 'usermap':     mk = self.usermap
-        if stage == 'mask':        mk = self.mask
 
-        colra, coldec = columns
+        # Choose stage based on its name in a pipeline
+        mk = getattr(self, stage)
 
-        if use_srcs:
-            # Fallbacks for sources argument to preserve compatibility
-            if sources is None:
-                if hasattr(self, 'sources'):
-                    sources = self.sources
-                else:
-                    raise ValueError("No input sources provided for use_srcs=True.")
-
-            srcs = None
-            if isinstance(sources, str):
-                # Try HATS first, fallback to astropy.table.Table.read
-                try:
-                    import lsdb
-                    srcs = lsdb.read_hats(sources, columns=columns).compute()
-                except Exception:
-                    srcs = Table.read(sources)
-            elif isinstance(sources, Table):
-                srcs = sources
-            elif isinstance(sources, pd.DataFrame):
-                srcs = Table.from_pandas(sources)
-            else:
-                raise ValueError("sources must be a path, astropy.table.Table, or pandas.DataFrame")
-
-            xx, yy = srcs[colra], srcs[coldec]
-            stage = 'sources'
-        else:
-            # Use randoms for scatter plot
-            xx, yy = hsp.make_uniform_randoms_fast(mk, nr)
+        # Use randoms for scatter plot
+        xx, yy = hsp.make_uniform_randoms_fast(mk, nr)
 
         # Do plot ------------------------------------------
         if not(ax): fig, ax = plt.subplots(figsize=figsize)
@@ -1373,45 +1338,196 @@ class SkyMaskPipe:
         #if not(ax): plt.show()
 
 
-
-    def plot2compare(self, stage='mask', nr=50_000, s=0.5, figsize=[12,6], xwin=None, ywin=None,
-                     plot_stars=False, plot_boxes=False, sources=None, columns=['ra','dec'], **kwargs):
+    @staticmethod
+    def pix_in_box(stage, ralims, declims):
         """
-        Compare input sources and random points generated over a mask
+        Returns the pixels of stage map that are within a ra-dec box
 
         Parameters
         ----------
-        stage : string
-            Mask stage to plot, e.g. 'mask', 'foot', 'holemap', etc.
-        nr : int
-            Number of randoms
-        s : float
-            Point size
-        figsize : list of floats
-            Figure size
-        xwin : list of floats
-            plot limits in ra, e.g. xwin=[226.5,227.5]
-        ywin : list of floats
-            plot limits in dec, e.g. ywin=[10.,11.]
-        plot_stars : bool
-            Overlay circles due to bright stars
-        plot_boxes : bool
-            Overlay boxes due to bright stars
-        sources : str, astropy.table.Table or pandas.DataFrame
-            The input sources to plot. If None, will try to use self.sources which holds the file path when the footprint mask was created from catalog on disk.
-        columns : list of str
-            Columns for RA and DEC
-        kwargs : [key=val]
-            Adittional keyword arguments passed to mataplolib.scatter()
+        stage : healsparse map
+            Stage map
+
+        Returns
+        -------
+        pixels : array-like
+            List of pixels within the box
         """
-        fig, (ax1, ax2) = plt.subplots(1,2, figsize=figsize)
+        ra_min, ra_max = ralims[0], ralims[1]
+        dec_min, dec_max = declims[0], declims[1]
 
-        self.plot(stage=stage, nr=nr, s=s, figsize=[figsize[0]*0.5, figsize[1]], xwin=xwin, ywin=ywin,
-                  plot_stars=plot_stars, plot_boxes=plot_boxes, use_srcs=True, sources=sources, columns=columns, ax=ax1 ,**kwargs)
+        # Get pixel centers
+        lon_deg, lat_deg = hp.pix2ang(stage.nside_sparse, stage.valid_pixels, nest=True, lonlat=True)
 
-        self.plot(stage=stage, nr=nr, s=s, figsize=[figsize[0]*0.5, figsize[1]], xwin=xwin, ywin=ywin,
-                  plot_stars=plot_stars, plot_boxes=plot_boxes, use_srcs=False, ax=ax2, **kwargs)
+        def in_ra_range(lon, lo, hi):
+            # Handles wrap-around (e.g., lo=350, hi=10)
+            if hi >= lo:
+                return (lon >= lo) & (lon <= hi)
+            else:
+                return (lon >= lo) | (lon <= hi)
 
+        # Get pixels inside box
+        sel = ( in_ra_range(lon_deg, ra_min, ra_max) & (lat_deg >= dec_min) & (lat_deg <= dec_max) )
+        return stage.valid_pixels[sel]
+
+
+
+    def plot_moc(self, stage, center=None, fov=None, clipra=None, clipdec=None,
+                frame='icrs', projection='SIN', figsize=(10, 5),
+                color='green', alpha=0.2, linewidth=1.0, label=None,
+                ax=None, wcs=None, show=False):
+        """
+        Plot a MOC version of a given stage or healsparse map. Optionally clip pixels outside
+        a given ra-dec box to speed up zoomed plot of mask of high orders
+
+        Parameters
+        ----------
+        stage : hspmap or string
+            Healsparse map-like or string corresponding to a SkyMaskPipe stage
+        center : SkyCoord
+            Center of plot (required on first call when ax/wcs are not provided)
+        fov    : Angle
+            Field of view (required on first call when ax/wcs are not provided)
+        clipra : tuple[float,float]
+            Clip healsparse pixels outside ra limis (in deg), before building the MOC
+        clipdec : tuple[float,float]
+            Clip healsparse pixels outside dec limis (in deg), before building the MOC
+        frame : string
+            Coordinate frame. 'icrs' | 'galactic' | ...
+        projection : string
+            Projection type for WCS. 'SIN', 'AIT', 'TAN', etc.
+        figsize : tuple
+            Figure size
+        color, alpha, linewidth : matplotlib color, flot, float
+            Color, transparency, border linewidth
+        ax, wcs : axes type, wcs type
+            Axes and WCS objects. Pass these from a previous call to layer plots
+        show : bool
+            Call plt.show() if True
+
+        Returns
+        -------
+        fig, ax, wcs : figure, axes, wcs
+            The figure, the axes and the WCS objects. Useful to build layered plots
+        """
+
+        # Choose stage based on input healsparse map or the name of stage in a pipeline
+        if hasattr(stage, 'valid_pixels'):
+            stage = stage
+        else:
+            stage = getattr(self, stage)
+
+        # Crop pixels outside box to speed plotting, if requested
+        pixels = (self.pix_in_box(stage, clipra, clipdec)
+                if (clipra is not None and clipdec is not None)
+                else stage.valid_pixels)
+        order = int(np.log2(stage.nside_sparse))
+        moc = MOC.from_healpix_cells(ipix=pixels, depth=order, max_depth=order)
+
+        # Create figure and WCS if appropiate
+        created_context = False
+        if ax is None or wcs is None:
+            if center is None or fov is None:
+                raise ValueError("When ax/wcs are not provided, you must pass center and fov.")
+            fig = plt.figure(figsize=figsize)
+            # Keep the WCS object to reuse later; we enter the context only for creation.
+            with WCS(fig, fov=fov, center=center,
+                    coordsys=frame, projection=projection,
+                    rotation=Angle(0, u.deg)) as _wcs:
+                ax = fig.add_subplot(1, 1, 1, projection=_wcs)
+                # basic formatting only once (on first creation)
+                lon = ax.coords['ra']; lat = ax.coords['dec']
+                lon.set_format_unit(u.deg, decimal=True, show_decimal_unit=True)
+                lat.set_format_unit(u.deg, decimal=True, show_decimal_unit=True)
+                ax.set_xlabel("ra"); ax.set_ylabel("dec")
+                ax.grid(color="black", linestyle="dotted")
+                wcs = _wcs
+                created_context = True
+        else:
+            fig = ax.figure
+
+        # Draw the MOC on the provided/created axes & wcs
+        moc.fill(ax=ax, wcs=wcs, alpha=alpha, fill=True, color=color, zorder=1, label=label)
+        moc.border(ax=ax, wcs=wcs, alpha=max(0.6, alpha), color='k',
+                   linewidth=linewidth, zorder=2)
+
+        if show: plt.show()
+        return fig, ax, wcs
+
+
+
+    def plot_srcs(self, ra, dec,
+                center=None, fov=None,
+                frame='icrs', projection='SIN',
+                figsize=(10, 5), ax=None, wcs=None, show=False,
+                marker='.', s=0.5, color='k', edgecolor='none',
+                alpha=0.5, zorder=8, label=None, **scatter_kwargs):
+        """
+        Overlay sources on the current figure with WCS axes (or create one if needed).
+
+        Parameters
+        ----------
+        ra, dec : array-like in degrees
+            RA/Dec of sources
+        center : SkyCoord
+            Center of plot (required on first call when ax/wcs are not provided)
+        fov    : Angle
+            Field of view (required on first call when ax/wcs are not provided)
+        frame : string
+            Coordinate frame. 'icrs' | 'galactic' | ...
+        projection : string
+            Projection type for WCS. 'SIN', 'AIT', 'TAN', etc.
+        figsize : tuple
+            Figure size
+        ax, wcs : axes type, wcs type
+            Axes and WCS objects. Pass these from a previous call to layer plots
+        show : bool
+            Call plt.show() if True
+        marker, s, color, edgecolor : string, float, color, color
+            Marker symbol, size, color and edge color
+        alpha, zorder, label : float, integer, string
+            Transparency, zorder and label for the set of points
+        scatter_kwargs : various
+            Extra arguments passed to ax.scatter
+
+        Returns
+        -------
+        fig, ax, wcs
+            The figure, the axes and the WCS objects. Useful to build layered plots
+        """
+
+        lon = np.asanyarray(ra, dtype=float)
+        lat = np.asanyarray(dec, dtype=float)
+
+        # Create axes/WCS if not provided (first call)
+        created = False
+        if ax is None or wcs is None:
+            if center is None or fov is None:
+                raise ValueError("When ax/wcs are not provided, pass 'center' and 'fov'.")
+            fig = plt.figure(figsize=figsize)
+            with WCS(fig, fov=fov, center=center,
+                    coordsys=frame, projection=projection,
+                    rotation=Angle(0, u.deg)) as _wcs:
+                ax = fig.add_subplot(1, 1, 1, projection=_wcs)
+                # Basic formatting only once
+                lon_c = ax.coords['ra']; lat_c = ax.coords['dec']
+                lon_c.set_format_unit(u.deg, decimal=True, show_decimal_unit=True)
+                lat_c.set_format_unit(u.deg, decimal=True, show_decimal_unit=True)
+                ax.set_xlabel("ra"); ax.set_ylabel("dec")
+                ax.grid(color="black", linestyle="dotted")
+                wcs = _wcs
+                created = True
+        else:
+            fig = ax.figure
+
+        # Plot sources in world coordinates of the axes
+        ax.scatter(lon, lat,
+                   s=s, marker=marker, color=color, edgecolors=edgecolor,
+                   alpha=alpha, zorder=zorder, label=label,
+                   transform=ax.get_transform('world'), **scatter_kwargs)
+
+        if show: plt.show()
+        return fig, ax, wcs
 
 
 
