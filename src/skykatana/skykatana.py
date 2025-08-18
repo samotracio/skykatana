@@ -5,11 +5,12 @@ import matplotlib.pyplot as plt
 import lsdb
 from astropy.table import Table, join
 from astropy.coordinates import Angle, Latitude, Longitude, SkyCoord
-from mocpy import MOC
+import astropy.units as u
+from mocpy import MOC, WCS
 from tqdm import tqdm
 import re
 import pickle
-
+import pandas as pd
 
 
 class SkyMaskPipe:
@@ -59,7 +60,7 @@ class SkyMaskPipe:
         self.usermap     = None
         self.extendedmap = None
         self.mask        = None
-        self.hatscat     = None
+        self.sources     = None
         self.qafile      = None
         self.patchfile   = None
         self.star_regs   = None
@@ -102,7 +103,7 @@ class SkyMaskPipe:
         return "\n".join(lines)
 
     # #########################
-    # Uncomment this if you want to display the summary just by typing the name of the pipeline object
+    # Uncomment this if you want to display the summary just by typing the name of the object
     #__repr__ = __str__
     ###########################
 
@@ -413,7 +414,7 @@ class SkyMaskPipe:
         b = np.where(width_larger, 0.5 * height, 0.5 * width)
         angle = np.where(width_larger, Angle(90, 'deg'), 0)
 
-        # Boxes seem to strech at high declination. For now, multiply by cos(dec) #######
+        # Boxes strech at high declination. For now, multiply by cos(dec) #######
         a = a*np.cos(table[coldec].value*np.pi/180.)
 
         mocs = MOC.from_boxes(
@@ -506,7 +507,7 @@ class SkyMaskPipe:
         hsp_map
             Healsparse boolean map
         """
-        print('BUILDING BRIGHT STAR HOLES MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
+        print('BUILDING BRIGHT STAR HOLES MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
 
         if order_holes: self.order_holes=order_holes
 
@@ -809,24 +810,27 @@ class SkyMaskPipe:
 
 
 
-    def build_footprint_mask(self, hatscat=None, order_foot=None, columns=['ra','dec'],
-                             remove_isopixels=False, erode_borders=False):
+    def build_footprint_mask(self, sources, order_foot=None, columns=['ra','dec'],
+                             remove_isopixels=False, erode_borders=False, mapping=False):
         """
-        Create a footprint map of a source catalog, pixelated at a given order. Optionally remove isolated
-        empty pixels and erode borders around empty zones. For details see remove_isopixels() and erode_borders()
+        Create a footprint map of a source catalog (from any astropy-supported table or HATS),
+        pixelated at a given order. Optionally remove isolated empty pixels and erode borders
+        around empty zones. For details see remove_isopixels() and erode_borders()
 
         Parameters
         ----------
-        hatscat : str
-            Path to catalog (HATS directory)
+        sources : str, astropy.table.Table, pandas.DataFrame, or HATS catalog
+            Input catalog or path to catalog (any format supported by astropy or lsdb.read_hats for HATS)
         order_foot : int
             Pixelization order
+        columns : list of str
+            Columns for ra, dec
         remove_isopixels : bool
             Remove isolated (empty) pixels surrounded by 8 non-empty pixels
         erode_borders : bool
             Detect and remove border pixels around holes
-        columns : list of str
-            Columns for ra, dec
+        mapping : bool
+            If True, distribute pixelization across HATS partitions. A Dask cluster must be running
 
         Returns
         -------
@@ -834,28 +838,62 @@ class SkyMaskPipe:
             Healsparse boolean map
         """
 
-        if hatscat: self.hatscat=hatscat
-        if columns: self.hatscat_columns=columns
-        if order_foot: self.order_foot=order_foot
+        def footpartition(df, pixel, order_foot=15, order_cov=6, columns=['ra','dec']):
+            # Returns a df with the list of pixels of the input df
+            nside_foot   = 2**order_foot
+            nside_cov    = 2**order_cov
+            foot = hsp.HealSparseMap.make_empty(nside_cov, nside_foot, dtype=np.bool_)
+            pixels = hp.ang2pix(nside_foot, df[columns[0]], df[columns[1]], nest=True, lonlat=True)
+            foot.update_values_pix(pixels, np.full_like(pixels, True, dtype=np.bool_), operation='or')
+            outdf = pd.DataFrame(foot.valid_pixels, columns=['pxs'])
+            return outdf
+
+        metafootpartition = pd.DataFrame([{"pxs": 0}])
+
+
+        if order_foot: self.order_foot = order_foot
         colra, coldec = columns
         print('BUILDING FOOTPRINT MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
 
-        # Create empty healsparse empty
-        nside_foot   = 2**self.order_foot
+        # Create empty healsparse foot
+        nside_foot = 2**self.order_foot
         self.foot = hsp.HealSparseMap.make_empty(self.nside_cov, nside_foot, dtype=np.bool_)
 
-        # Read (ra,dec) from a HATS catalog
-        print('--- Pixelating HATS catalog from:', self.hatscat)
-        print('    Order ::',self.order_foot)
-        srcs = lsdb.read_hats(self.hatscat, columns=columns).compute()
+        # Read sources and pixelize based on input type
+        srcs = None
+        if str(sources.__class__) == "<class 'lsdb.catalog.catalog.Catalog'>" :
+            print('--- Pixelating HATS catalog')
+            import lsdb
+            srcs = sources
+            if mapping:
+                print(f"    Partitions for mapping: {srcs.npartitions:<7}")
+                pixdf = srcs.map_partitions(footpartition, include_pixel=True, meta=metafootpartition,
+                                            order_foot=self.order_foot, order_cov=self.order_cov, columns=columns).compute()
+                pixels = np.array(pixdf['pxs'].values)
+            else:
+                srcs = srcs[columns].compute()
+                pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True) # get pixel nr for each object
+        elif isinstance(sources, Table):
+            print('--- Pixelating sources')
+            srcs = sources
+            pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True) # get pixel nr for each object
+        elif isinstance(sources, pd.DataFrame):
+            print('--- Pixelating sources')
+            srcs = Table.from_pandas(sources)
+            pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True) # get pixel nr for each object
+        elif isinstance(sources, str):
+            print('--- Pixelating sources from:', sources)
+            srcs = Table.read(sources)
+            pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True) # get pixel nr for each object
+        else:
+            raise ValueError("sources must be a str, astropy.table.Table, or pandas.DataFrame")
 
-        # Get pixel number for each object
-        pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True)
+        print('    Order ::',self.order_foot)
 
         # Update map values for pixels that have objects
         self.foot.update_values_pix(pixels, np.full_like(pixels, True, dtype=np.bool_), operation='or')
 
-        # Remove isolated empty pixels and borders aound holes, if requested
+        # Remove isolated empty pixels and borders around holes, if requested
         if remove_isopixels:
             self.foot = self.remove_isopixels(self.foot)
 
@@ -865,92 +903,300 @@ class SkyMaskPipe:
         print('--- Footprint map area                    :', self.foot.get_valid_area(degrees=True))
 
 
+    # def build_footprint_mask(self, sources, order_foot=None, columns=['ra','dec'],
+    #                          remove_isopixels=False, erode_borders=False, mapping=False):
+    #     """
+    #     Create a footprint map of a source catalog (from any astropy-supported table or HATS),
+    #     pixelated at a given order. Optionally remove isolated empty pixels and erode borders
+    #     around empty zones. For details see remove_isopixels() and erode_borders()
+    #
+    #     Parameters
+    #     ----------
+    #     sources : str, astropy.table.Table, pandas.DataFrame, or HATS catalog
+    #         Input catalog or path to catalog (any format supported by astropy or lsdb.read_hats for HATS)
+    #     order_foot : int
+    #         Pixelization order
+    #     remove_isopixels : bool
+    #         Remove isolated (empty) pixels surrounded by 8 non-empty pixels
+    #     erode_borders : bool
+    #         Detect and remove border pixels around holes
+    #     columns : list of str
+    #         Columns for ra, dec
+    #
+    #     Returns
+    #     -------
+    #     hsp_map
+    #         Healsparse boolean map
+    #     """
+    #
+    #     def footpartition(df, pixel, order_foot=15, order_cov=6, columns=['ra','dec']):
+    #         # Returns the df with the list of pixels of the footprint
+    #         nside_foot   = 2**order_foot
+    #         nside_cov    = 2**order_cov
+    #         foot = hsp.HealSparseMap.make_empty(nside_cov, nside_foot, dtype=np.bool_)
+    #         pixels = hp.ang2pix(nside_foot, df[columns[0]], df[columns[1]], nest=True, lonlat=True)
+    #         foot.update_values_pix(pixels, np.full_like(pixels, True, dtype=np.bool_), operation='or')
+    #         outdf = pd.DataFrame(foot.valid_pixels, columns=['pxs'])
+    #         return outdf
+    #
+    #     metafootpartition = pd.DataFrame(
+    #         [{
+    #             "pxs": 0,
+    #         }])
+    #
+    #     if order_foot: self.order_foot = order_foot
+    #     colra, coldec = columns
+    #     print('BUILDING FOOTPRINT MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
+    #
+    #     # Create empty healsparse foot
+    #     nside_foot = 2**self.order_foot
+    #     self.foot = hsp.HealSparseMap.make_empty(self.nside_cov, nside_foot, dtype=np.bool_)
+    #
+    #     import lsdb
+    #
+    #     # Read sources: dispatch based on input type
+    #     srcs = None
+    #     locstring = '[argument]'
+    #     if isinstance(sources, str) or isinstance(sources, lsdb.catalog.catalog.Catalog):
+    #         # Try HATS first, fallback to astropy.table.Table.read
+    #         try:
+    #             if mapping:
+    #                 cat = sources
+    #                 if isinstance(sources, str):
+    #                     cat = lsdb.open_catalog(sources)
+    #                     locstring = sources
+    #                 print('--- Pixelating HATS catalog from:', locstring)
+    #                 print('    Partitions for mapping:', cat.npartitions)
+    #                 pixdf = cat.map_partitions(footpartition, include_pixel=True, meta=metafootpartition,
+    #                                            order_foot=self.order_foot, order_cov=self.order_cov, columns=columns).compute()
+    #                 pixels = np.array(pixdf['pxs'].values)
+    #                 self.sources = sources    # store the path
+    #             else:
+    #                 print('--- Pixelating HATS catalog from:', locstring)
+    #                 srcs = lsdb.read_hats(sources, columns=columns).compute()
+    #                 # Get pixel number for each object
+    #                 pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True)
+    #                 self.sources = sources    # store the path
+    #         except Exception:
+    #             srcs = Table.read(sources)
+    #             self.sources = sources    # store the path
+    #             print('--- Pixelating sources from:', self.sources)
+    #             # Get pixel number for each object
+    #             pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True)
+    #     elif isinstance(sources, Table):
+    #         print('--- Pixelating sources')
+    #         srcs = sources
+    #         # Get pixel number for each object
+    #         pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True)
+    #     elif isinstance(sources, pd.DataFrame):
+    #         print('--- Pixelating sources')
+    #         srcs = Table.from_pandas(sources)
+    #         pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True)
+    #     else:
+    #         raise ValueError("sources must be a path, astropy.table.Table, or pandas.DataFrame")
+    #
+    #     print('    Order ::',self.order_foot)
+    #
+    #     # Update map values for pixels that have objects
+    #     self.foot.update_values_pix(pixels, np.full_like(pixels, True, dtype=np.bool_), operation='or')
+    #
+    #     # Remove isolated empty pixels and borders around holes, if requested
+    #     if remove_isopixels:
+    #         self.foot = self.remove_isopixels(self.foot)
+    #
+    #     if erode_borders:
+    #         self.foot = self.erode_borders(self.foot)
+    #
+    #     print('--- Footprint map area                    :', self.foot.get_valid_area(degrees=True))
+
+
+    # def BAKBAKbuild_footprint_mask(self, sources, order_foot=None, columns=['ra','dec'],
+    #                          remove_isopixels=False, erode_borders=False):
+    #     """
+    #     Create a footprint map of a source catalog (from any astropy-supported table or HATS),
+    #     pixelated at a given order. Optionally remove isolated empty pixels and erode borders
+    #     around empty zones. For details see remove_isopixels() and erode_borders()
+    #
+    #     Parameters
+    #     ----------
+    #     sources : str, astropy.table.Table, pandas.DataFrame, or HATS catalog
+    #         Input catalog or path to catalog (any format supported by astropy or lsdb.read_hats for HATS)
+    #     order_foot : int
+    #         Pixelization order
+    #     remove_isopixels : bool
+    #         Remove isolated (empty) pixels surrounded by 8 non-empty pixels
+    #     erode_borders : bool
+    #         Detect and remove border pixels around holes
+    #     columns : list of str
+    #         Columns for ra, dec
+    #
+    #     Returns
+    #     -------
+    #     hsp_map
+    #         Healsparse boolean map
+    #     """
+    #
+    #     if order_foot: self.order_foot = order_foot
+    #     colra, coldec = columns
+    #     print('BUILDING FOOTPRINT MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
+    #
+    #     # Create empty healsparse foot
+    #     nside_foot = 2**self.order_foot
+    #     self.foot = hsp.HealSparseMap.make_empty(self.nside_cov, nside_foot, dtype=np.bool_)
+    #
+    #     # Read sources: dispatch based on input type
+    #     srcs = None
+    #     if isinstance(sources, str):
+    #         # Try HATS first, fallback to astropy.table.Table.read
+    #         try:
+    #             import lsdb
+    #             srcs = lsdb.read_hats(sources, columns=columns).compute()
+    #             self.sources = sources    # store the path
+    #             print('--- Pixelating HATS catalog from:', self.sources)
+    #         except Exception:
+    #             srcs = Table.read(sources)
+    #             self.sources = sources    # store the path
+    #             print('--- Pixelating sources from:', self.sources)
+    #     elif isinstance(sources, Table):
+    #         srcs = sources
+    #         print('--- Pixelating sources')
+    #     elif isinstance(sources, pd.DataFrame):
+    #         srcs = Table.from_pandas(sources)
+    #         print('--- Pixelating sources')
+    #     else:
+    #         raise ValueError("sources must be a path, astropy.table.Table, or pandas.DataFrame")
+    #
+    #     print('    Order ::',self.order_foot)
+    #
+    #     # Get pixel number for each object
+    #     pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True)
+    #
+    #     # Update map values for pixels that have objects
+    #     self.foot.update_values_pix(pixels, np.full_like(pixels, True, dtype=np.bool_), operation='or')
+    #
+    #     # Remove isolated empty pixels and borders around holes, if requested
+    #     if remove_isopixels:
+    #         self.foot = self.remove_isopixels(self.foot)
+    #
+    #     if erode_borders:
+    #         self.foot = self.erode_borders(self.foot)
+    #
+    #     print('--- Footprint map area                    :', self.foot.get_valid_area(degrees=True))
+
+
     def combine_mask(self, apply_patchmap=True, apply_propmap=False, apply_holemap=True,
-                     apply_extendedmap=True, apply_usermap=False):
+                    apply_extendedmap=True, apply_usermap=False, footprint_override=None):
         """
-        Combine a footprint map with **4 (optional) masks**:
-
-        1) A patch map containing valid patches
-
-        2) A property map containing valid pixels meeting a given threshold of a certain property
-
-        3) A holes map due to bright stars/boxes
-
-        4) A holes map due to extended sources
-
-        5) A user defined map of arbitrary regions
+        Combine a footprint map with optional masks.
 
         Parameters
         ----------
         apply_patchmap : bool
-            Apply patch map of accepted patches
+            Apply patch map of accepted patches.
         apply_propmap : bool
-            Apply property map of accepted pixels
+            Apply property map of accepted pixels.
         apply_holemap : bool
-            Apply holes map due to bright stars and boxes
+            Apply holes map due to bright stars and boxes.
         apply_extendedmap : bool
-            Apply holes map due to extended sources
+            Apply holes map due to extended sources.
         apply_usermap : bool
-            Apply map of user defined regions
+            Apply user-defined region mask.
+        footprint_override : HealSparseMap, optional
+            Use this instead of the default footprint map.
 
         Returns
         -------
         hsp_map
-            Healsparse boolean map
+            Final combined boolean HealSparseMap mask.
         """
 
         print('COMBINING MAPS >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
 
-        # Upgrade maps if needed up to the desired resolution
-        otmp = int(np.log2(self.foot.nside_sparse))
-        if otmp < self.order_out:
-            print('--- footprint order upgraded to:', self.order_out)
-            self.foot = self.foot.upgrade(self.nside_out)
-            self.order_foot = self.order_out
+        # Choose base map
+        base_map = footprint_override or self.foot
 
+        # Validate disallowed overrides
+        if (footprint_override is self.holemap) and (self.holemap is not(None)):
+            raise ValueError("Cannot use holemap as footprint_override (negative area).")
+
+        if footprint_override is self.usermap and getattr(self, 'usermap_type', None) == 'negative':
+            raise ValueError("Cannot use negative usermap as footprint_override (negative area).")
+
+        # Skip any maps that are used as the override
+        if footprint_override is self.patchmap:
+            if apply_patchmap:
+                print('--- footprint_override is patchmap: skipping patchmap')
+            apply_patchmap = False
+
+        if footprint_override is self.propmap:
+            if apply_propmap:
+                print('--- footprint_override is propmap: skipping propmap')
+            apply_propmap = False
+
+        if footprint_override is self.extendedmap:
+            if apply_extendedmap:
+                print('--- footprint_override is extendedmap: skipping extendedmap')
+            apply_extendedmap = False
+
+        if footprint_override is self.usermap:
+            if apply_usermap:
+                print('--- footprint_override is usermap: skipping usermap')
+            apply_usermap = False
+
+        # Upgrade base map if needed
+        otmp = int(np.log2(base_map.nside_sparse))
+        if otmp < self.order_out:
+            print('--- base map upgraded to:', self.order_out)
+            base_map = base_map.upgrade(self.nside_out)
+
+        if footprint_override is not None:
+            self.foot_override = base_map
+
+        self.order_foot = self.order_out
+
+        # Upgrade other maps if needed
         if apply_patchmap and self.patchmap:
             otmp = int(np.log2(self.patchmap.nside_sparse))
             if otmp < self.order_out:
-                print('--- patchmap order upgraded to: ', self.order_out)
+                print('--- patchmap order upgraded to:', self.order_out)
                 self.patchmap = self.patchmap.upgrade(self.nside_out)
                 self.order_patch = self.order_out
 
         if apply_holemap and self.holemap:
             otmp = int(np.log2(self.holemap.nside_sparse))
             if otmp < self.order_out:
-                print('--- holemap order upgraded to: ', self.order_out)
+                print('--- holemap order upgraded to:', self.order_out)
                 self.holemap = self.holemap.upgrade(self.nside_out)
                 self.order_holes = self.order_out
 
         if apply_propmap and self.propmap:
             otmp = int(np.log2(self.propmap.nside_sparse))
             if otmp < self.order_out:
-                print('--- propmap order upgraded to: ', self.order_out)
+                print('--- propmap order upgraded to:', self.order_out)
                 self.propmap = self.propmap.upgrade(self.nside_out)
                 self.order_prop = self.order_out
 
         if apply_usermap and self.usermap:
             otmp = int(np.log2(self.usermap.nside_sparse))
             if otmp < self.order_out:
-                print('--- usermap order upgraded to: ', self.order_out)
+                print('--- usermap order upgraded to:', self.order_out)
                 self.usermap = self.usermap.upgrade(self.nside_out)
                 self.order_user = self.order_out
 
         if apply_extendedmap and self.extendedmap:
             otmp = int(np.log2(self.extendedmap.nside_sparse))
             if otmp < self.order_out:
-                print('--- extendedmap order upgraded to: ', self.order_out)
+                print('--- extendedmap order upgraded to:', self.order_out)
                 self.extendedmap = self.extendedmap.upgrade(self.nside_out)
                 self.order_extended = self.order_out
 
-        # Create empty map to contain the final mask and perform combination
+        # Create empty mask
         self.mask = hsp.HealSparseMap.make_empty(self.nside_cov, self.nside_out, dtype=np.bool_)
 
-        # Start from footprint map
-        self.mask |= self.foot
-        # Should we consider an anternative flow with no footmap, and starting from
-        # the usermap?
+        # Start from base map
+        self.mask |= base_map
 
+        # Combine stages
         if apply_patchmap:
             if self.patchmap:
                 self.mask = self.intersect_boolmask(self.patchmap, self.mask)
@@ -984,12 +1230,6 @@ class SkyMaskPipe:
             else:
                 raise Exception('usermap not defined')
 
-        #if apply_usermap:
-        #    if self.usermap:
-        #        self.mask = self.intersect_boolmask(self.usermap, self.mask)
-        #    else:
-        #        raise Exception('usermap not defined')
-
         print('--- Combined map area                     :', self.mask.get_valid_area(degrees=True))
 
 
@@ -1020,15 +1260,20 @@ class SkyMaskPipe:
         return msk
 
 
+
     def plot(self, stage='mask', nr=50_000, s=0.5, figsize=[12,6], xwin=None, ywin=None,
-             plot_stars=False, plot_boxes=False, use_srcs=False, ax=None, **kwargs):
+            plot_stars=False, plot_boxes=False, ax=None, **kwargs):
         """
-        Visualize a mask by means of its randoms points
+        Quickly visualize a mask stage by means of randoms points in an x-y plot (no WCS projection).
+        Optionally plot circles and boxes to inspect areas masked by stars. If you need more precise
+        sky plots, use plot_moc() and plot_srcs()
+
+        Note boxes shoud not cross the 360/0 boundary
 
         Parameters
         ----------
         stage : string
-            Masking stage to use, e.g. 'mask', 'foot', 'holemap', etc.
+            Mask stage to plot, e.g. 'mask', 'foot', 'holemap', etc.
         nr : integer
             Number of randoms
         s : float
@@ -1043,29 +1288,17 @@ class SkyMaskPipe:
             Overlay circles due to bright stars
         plot_boxes : bool
             Overlay boxes due to bright stars
-        use_srcs : bool
-            Plot input sources used to build the footprint map, instead of random points. Note this means that no mask of any kind is actually plotted
         ax : axes
             If given, plot will be added to the axes object provided
         kwargs : [key=val]
             Adittional keyword arguments passed to mataplolib.scatter()
         """
-        if stage == 'foot':        mk = self.foot
-        if stage == 'patchmap':    mk = self.patchmap
-        if stage == 'propmap':     mk = self.propmap
-        if stage == 'holemap':     mk = self.holemap
-        if stage == 'extendedmap': mk = self.extendedmap
-        if stage == 'usermap':     mk = self.usermap
-        if stage == 'mask':        mk = self.mask
 
-        if use_srcs:
-            # Use catalog for scatter plot
-            srcs = lsdb.read_hats(self.hatscat, columns=self.hatscat_columns).compute()
-            xx, yy = srcs[self.hatscat_columns[0]], srcs[self.hatscat_columns[1]]
-            stage = 'sources'
-        else:
-             # Use randoms for scatter plot
-             xx, yy = hsp.make_uniform_randoms_fast(mk, nr)
+        # Choose stage based on its name in a pipeline
+        mk = getattr(self, stage)
+
+        # Use randoms for scatter plot
+        xx, yy = hsp.make_uniform_randoms_fast(mk, nr)
 
         # Do plot ------------------------------------------
         if not(ax): fig, ax = plt.subplots(figsize=figsize)
@@ -1105,41 +1338,196 @@ class SkyMaskPipe:
         #if not(ax): plt.show()
 
 
-
-    def plot2compare(self, stage='mask', nr=50_000, s=0.5, figsize=[12,6], xwin=None, ywin=None,
-                     plot_stars=False, plot_boxes=False, **kwargs):
+    @staticmethod
+    def pix_in_box(stage, ralims, declims):
         """
-        Compare input sources and random points generate over a mask
+        Returns the pixels of stage map that are within a ra-dec box
 
         Parameters
         ----------
-        stage : string
-            Masking stage to use, e.g. 'mask', 'foot', 'holemap', etc.
-        nr : int
-            Number of randoms
-        s : float
-            Point size
-        figsize : list of floats
-            Figure size
-        xwin : list of floats
-            plot limits in ra, e.g. xwin=[226.5,227.5]
-        ywin : list of floats
-            plot limits in dec, e.g. ywin=[10.,11.]
-        plot_stars : bool
-            Overlay circles due to bright stars
-        plot_boxes : bool
-            Overlay boxes due to bright stars
-        kwargs : [key=val]
-            Adittional keyword arguments passed to mataplolib.scatter()
+        stage : healsparse map
+            Stage map
+
+        Returns
+        -------
+        pixels : array-like
+            List of pixels within the box
         """
-        fig, (ax1, ax2) = plt.subplots(1,2, figsize=figsize)
+        ra_min, ra_max = ralims[0], ralims[1]
+        dec_min, dec_max = declims[0], declims[1]
 
-        self.plot(stage=stage, nr=nr, s=s, figsize=[figsize[0]*0.5, figsize[1]], xwin=xwin, ywin=ywin,
-                  plot_stars=plot_stars, plot_boxes=plot_boxes, use_srcs=True, ax=ax1 ,**kwargs)
+        # Get pixel centers
+        lon_deg, lat_deg = hp.pix2ang(stage.nside_sparse, stage.valid_pixels, nest=True, lonlat=True)
 
-        self.plot(stage=stage, nr=nr, s=s, figsize=[figsize[0]*0.5, figsize[1]], xwin=xwin, ywin=ywin,
-                  plot_stars=plot_stars, plot_boxes=plot_boxes, use_srcs=False, ax=ax2, **kwargs)
+        def in_ra_range(lon, lo, hi):
+            # Handles wrap-around (e.g., lo=350, hi=10)
+            if hi >= lo:
+                return (lon >= lo) & (lon <= hi)
+            else:
+                return (lon >= lo) | (lon <= hi)
 
+        # Get pixels inside box
+        sel = ( in_ra_range(lon_deg, ra_min, ra_max) & (lat_deg >= dec_min) & (lat_deg <= dec_max) )
+        return stage.valid_pixels[sel]
+
+
+
+    def plot_moc(self, stage, center=None, fov=None, clipra=None, clipdec=None,
+                frame='icrs', projection='SIN', figsize=(10, 5),
+                color='green', alpha=0.2, linewidth=1.0, label=None,
+                ax=None, wcs=None, show=False):
+        """
+        Plot a MOC version of a given stage or healsparse map. Optionally clip pixels outside
+        a given ra-dec box to speed up zoomed plot of mask of high orders
+
+        Parameters
+        ----------
+        stage : hspmap or string
+            Healsparse map-like or string corresponding to a SkyMaskPipe stage
+        center : SkyCoord
+            Center of plot (required on first call when ax/wcs are not provided)
+        fov    : Angle
+            Field of view (required on first call when ax/wcs are not provided)
+        clipra : tuple[float,float]
+            Clip healsparse pixels outside ra limis (in deg), before building the MOC
+        clipdec : tuple[float,float]
+            Clip healsparse pixels outside dec limis (in deg), before building the MOC
+        frame : string
+            Coordinate frame. 'icrs' | 'galactic' | ...
+        projection : string
+            Projection type for WCS. 'SIN', 'AIT', 'TAN', etc.
+        figsize : tuple
+            Figure size
+        color, alpha, linewidth : matplotlib color, flot, float
+            Color, transparency, border linewidth
+        ax, wcs : axes type, wcs type
+            Axes and WCS objects. Pass these from a previous call to layer plots
+        show : bool
+            Call plt.show() if True
+
+        Returns
+        -------
+        fig, ax, wcs : figure, axes, wcs
+            The figure, the axes and the WCS objects. Useful to build layered plots
+        """
+
+        # Choose stage based on input healsparse map or the name of stage in a pipeline
+        if hasattr(stage, 'valid_pixels'):
+            stage = stage
+        else:
+            stage = getattr(self, stage)
+
+        # Crop pixels outside box to speed plotting, if requested
+        pixels = (self.pix_in_box(stage, clipra, clipdec)
+                if (clipra is not None and clipdec is not None)
+                else stage.valid_pixels)
+        order = int(np.log2(stage.nside_sparse))
+        moc = MOC.from_healpix_cells(ipix=pixels, depth=order, max_depth=order)
+
+        # Create figure and WCS if appropiate
+        created_context = False
+        if ax is None or wcs is None:
+            if center is None or fov is None:
+                raise ValueError("When ax/wcs are not provided, you must pass center and fov.")
+            fig = plt.figure(figsize=figsize)
+            # Keep the WCS object to reuse later; we enter the context only for creation.
+            with WCS(fig, fov=fov, center=center,
+                    coordsys=frame, projection=projection,
+                    rotation=Angle(0, u.deg)) as _wcs:
+                ax = fig.add_subplot(1, 1, 1, projection=_wcs)
+                # basic formatting only once (on first creation)
+                lon = ax.coords['ra']; lat = ax.coords['dec']
+                lon.set_format_unit(u.deg, decimal=True, show_decimal_unit=True)
+                lat.set_format_unit(u.deg, decimal=True, show_decimal_unit=True)
+                ax.set_xlabel("ra"); ax.set_ylabel("dec")
+                ax.grid(color="black", linestyle="dotted")
+                wcs = _wcs
+                created_context = True
+        else:
+            fig = ax.figure
+
+        # Draw the MOC on the provided/created axes & wcs
+        moc.fill(ax=ax, wcs=wcs, alpha=alpha, fill=True, color=color, zorder=1, label=label)
+        moc.border(ax=ax, wcs=wcs, alpha=max(0.6, alpha), color='k',
+                   linewidth=linewidth, zorder=2)
+
+        if show: plt.show()
+        return fig, ax, wcs
+
+
+
+    def plot_srcs(self, ra, dec,
+                center=None, fov=None,
+                frame='icrs', projection='SIN',
+                figsize=(10, 5), ax=None, wcs=None, show=False,
+                marker='.', s=0.5, color='k', edgecolor='none',
+                alpha=0.5, zorder=8, label=None, **scatter_kwargs):
+        """
+        Overlay sources on the current figure with WCS axes (or create one if needed).
+
+        Parameters
+        ----------
+        ra, dec : array-like in degrees
+            RA/Dec of sources
+        center : SkyCoord
+            Center of plot (required on first call when ax/wcs are not provided)
+        fov    : Angle
+            Field of view (required on first call when ax/wcs are not provided)
+        frame : string
+            Coordinate frame. 'icrs' | 'galactic' | ...
+        projection : string
+            Projection type for WCS. 'SIN', 'AIT', 'TAN', etc.
+        figsize : tuple
+            Figure size
+        ax, wcs : axes type, wcs type
+            Axes and WCS objects. Pass these from a previous call to layer plots
+        show : bool
+            Call plt.show() if True
+        marker, s, color, edgecolor : string, float, color, color
+            Marker symbol, size, color and edge color
+        alpha, zorder, label : float, integer, string
+            Transparency, zorder and label for the set of points
+        scatter_kwargs : various
+            Extra arguments passed to ax.scatter
+
+        Returns
+        -------
+        fig, ax, wcs
+            The figure, the axes and the WCS objects. Useful to build layered plots
+        """
+
+        lon = np.asanyarray(ra, dtype=float)
+        lat = np.asanyarray(dec, dtype=float)
+
+        # Create axes/WCS if not provided (first call)
+        created = False
+        if ax is None or wcs is None:
+            if center is None or fov is None:
+                raise ValueError("When ax/wcs are not provided, pass 'center' and 'fov'.")
+            fig = plt.figure(figsize=figsize)
+            with WCS(fig, fov=fov, center=center,
+                    coordsys=frame, projection=projection,
+                    rotation=Angle(0, u.deg)) as _wcs:
+                ax = fig.add_subplot(1, 1, 1, projection=_wcs)
+                # Basic formatting only once
+                lon_c = ax.coords['ra']; lat_c = ax.coords['dec']
+                lon_c.set_format_unit(u.deg, decimal=True, show_decimal_unit=True)
+                lat_c.set_format_unit(u.deg, decimal=True, show_decimal_unit=True)
+                ax.set_xlabel("ra"); ax.set_ylabel("dec")
+                ax.grid(color="black", linestyle="dotted")
+                wcs = _wcs
+                created = True
+        else:
+            fig = ax.figure
+
+        # Plot sources in world coordinates of the axes
+        ax.scatter(lon, lat,
+                   s=s, marker=marker, color=color, edgecolors=edgecolor,
+                   alpha=alpha, zorder=zorder, label=label,
+                   transform=ax.get_transform('world'), **scatter_kwargs)
+
+        if show: plt.show()
+        return fig, ax, wcs
 
 
 
