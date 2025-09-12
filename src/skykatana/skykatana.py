@@ -11,6 +11,12 @@ from pathlib import Path, PosixPath
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable, Tuple, Union, Optional, Any, Dict, Sequence, List
 from matplotlib.axes import Axes
+# Supress info msgs from dask -> distributed.core INFO: Event loop was unresponsive in Nanny ...
+# which repeats a lot during pixelization of circles
+import logging
+logging.getLogger('distributed.core').setLevel(logging.ERROR)
+
+
 
 
 # Numba auxiliary kernels (compiled)
@@ -688,8 +694,10 @@ class SkyMaskPipe:
     ###########################
 
 
-    # Generic helper to stash params for any stage ----------
     def _store_params(self, stage: str, **params: Any) -> None:
+        """
+        Generic helper to stash params for any stage
+        """
         def _norm(v):
             if isinstance(v, (str, Path)):       # normalize paths & strings
                 return str(v)
@@ -698,7 +706,6 @@ class SkyMaskPipe:
             return v
         packed = {k: _norm(v) for k, v in params.items()}
         self._params.setdefault(stage, {}).update(packed)
-
 
 
     def write(self, outdir: str | os.PathLike, overwrite: bool = True,
@@ -794,6 +801,99 @@ class SkyMaskPipe:
             if tmpdir.exists() and tmpdir.parent != outdir:
                 shutil.rmtree(tmpdir, ignore_errors=True)
 
+
+    @staticmethod
+    def _band_polygon_lb(b0_deg: float, n_long_samples: int = 720) -> SkyCoord:
+        """
+        Build a single closed polygon (in Galactic coords) that traces the boundary
+        of the galactica plane band, |b| <= b0. The polygon runs along b=+b0 from ℓ=0→360,
+        then back along b=-b0 from ℓ=360→0
+        """
+        b0 = float(b0_deg)
+        l_up = np.linspace(0.0, 360.0, n_long_samples, endpoint=True)
+        l_dn = l_up[::-1]
+        b_up = np.full_like(l_up,  +b0)
+        b_dn = np.full_like(l_dn,  -b0)
+
+        l_poly = np.concatenate([l_up, l_dn, l_up[:1]])  # close polygon
+        b_poly = np.concatenate([b_up, b_dn, b_up[:1]])
+
+        return SkyCoord(l=l_poly * u.deg, b=b_poly * u.deg, frame="galactic")
+
+
+    @staticmethod
+    def _ellipse_polygon_lb(a_l_deg: float, b_b_deg: float,
+                            l0_deg: float = 0.0, b0_deg: float = 0.0,
+                            n_theta: int = 720) -> SkyCoord:
+        """
+        Build an ellipse polygon in Galactic coords centered at (l0, b0) with
+        semi-axes a_l (in longitude) and b_b (in latitude), both in degrees.
+        Parametric form: l = l0 + a_l cosθ, b = b0 + b_b sinθ
+        """
+        th = np.linspace(0.0, 2.0 * np.pi, n_theta, endpoint=True)
+        l = l0_deg + a_l_deg * np.cos(th)
+        b = b0_deg + b_b_deg * np.sin(th)
+
+        # Wrap longitudes to [0, 360)
+        l = np.mod(l, 360.0)
+
+        # Close polygon explicitly
+        if l[0] != l[-1] or b[0] != b[-1]:
+            l = np.concatenate([l, l[:1]])
+            b = np.concatenate([b, b[:1]])
+
+        return SkyCoord(l=l * u.deg, b=b * u.deg, frame="galactic")
+
+
+    @staticmethod
+    def gal_plane_bulge_moc(max_depth: int = 8, b0_deg: float = 15.,
+        bulge_a_deg: float = 25., bulge_b_deg: float = 20.,
+        bulge_center_l_deg: float = 0., bulge_center_b_deg: float = 0.,
+        band_longitude_samples: int = 1440, ellipse_samples: int = 720) -> MOC:
+        """
+        Create a MOC of the Galactic plane (|b| <= b0_deg) in union with an elliptical bulge.
+
+        Parameters
+        ----------
+        b0_deg : float
+            Half-thickness of the Galactic plane band (|b| <= b0_deg).
+        bulge_a_deg : float
+            Semi-axis along Galactic longitude for the bulge ellipse (degrees).
+        bulge_b_deg : float
+            Semi-axis along Galactic latitude for the bulge ellipse (degrees).
+        bulge_center_l_deg : float
+            Bulge ellipse center longitude (degrees, Galactic).
+        bulge_center_b_deg : float
+            Bulge ellipse center latitude (degrees, Galactic).
+        band_longitude_samples : int
+            Number of samples along longitude to trace the band boundary.
+        ellipse_samples : int
+            Number of parametric samples for the bulge ellipse.
+        max_depth : int
+            MOC max depth (HEALPix order). 8 ≈ 0.228° pixels (~13.7 arcmin).
+
+        Returns
+        -------
+        moc : mocpy.MOC
+            Union of the band and bulge MOCs, expressed in ICRS.
+        """
+        # Build polygons in Galactic coords
+        poly_band_gal   = SkyMaskPipe._band_polygon_lb(b0_deg, n_long_samples=band_longitude_samples)
+        poly_bulge_gal  = SkyMaskPipe._ellipse_polygon_lb(bulge_a_deg, bulge_b_deg,
+                                           l0_deg=bulge_center_l_deg, b0_deg=bulge_center_b_deg,
+                                           n_theta=ellipse_samples)
+
+        # Convert polygon vertices to ICRS
+        poly_band_icrs  = poly_band_gal.icrs
+        poly_bulge_icrs = poly_bulge_gal.icrs
+
+        # Build MOCs from polygons at requested resolution
+        moc_band  = MOC.from_polygon_skycoord(poly_band_icrs,  max_depth=max_depth)
+        moc_bulge = MOC.from_polygon_skycoord(poly_bulge_icrs, max_depth=max_depth)
+
+        # Make union of plane ∪ bulge
+        moc = moc_band.union(moc_bulge)
+        return moc
 
 
     @staticmethod
@@ -987,8 +1087,8 @@ class SkyMaskPipe:
 
 
     @staticmethod
-    def pixelate_circles(data, fmt='ascii', columns=['ra', 'dec', 'radius'], order=15,
-                         delta_depth=2, n_threads=4):
+    def BAKpixelate_circles(data, fmt='ascii', columns=['ra', 'dec', 'radius'], order=15,
+                            delta_depth=2, n_threads=4):
         """
         Read circular regions around bright stars, pixelize them and return the (unique) pixels inside.
         Coordinates and distances should be in degrees.
@@ -1022,13 +1122,62 @@ class SkyMaskPipe:
             table = Table.read(data, format=fmt)
         print('    Order ::',order)
 
+        print('    getting mocs from cones...')
         mocs = MOC.from_cones(
             lon=Longitude(table[colra], unit='deg'), lat=Latitude(table[coldec], unit='deg'), radius=Angle(table[colrad], unit='deg'),
             max_depth=order, delta_depth=delta_depth, n_threads=n_threads)
 
+        print('    flattening + concatenating...')
         hp_index = np.concatenate([moc.flatten() for moc in mocs])
         print('    done')
+        print('    uniquing+type64')
         return np.unique(hp_index).astype(np.int64)
+
+
+    @staticmethod
+    def pixelate_circles(data, stage, fmt='ascii', columns=('ra','dec','radius'),
+                         order=15, delta_depth=2, n_threads=1, chunk_size=600_000):
+        """
+        Pixelize many circles into HEALPix indices and return unique pixels as a NumPy array.
+        """
+        colra, coldec, colrad = columns
+        if isinstance(data, pd.DataFrame):
+            table = data
+            print('--- Pixelating circles from DataFrame')
+        elif isinstance(data, (str, PosixPath)):
+            print('--- Pixelating circles from', data)
+            table = Table.read(data, format=fmt)
+        else:
+            raise TypeError("data must be a DataFrame or path")
+
+        print(f'    Order :: {order} | pixelization_threads={n_threads}')
+        n_total = len(table)
+        print(f'    Circles to pixelate: {n_total} in batches of {chunk_size}')
+
+        for start in range(0, n_total, chunk_size):
+            end = min(start + chunk_size, n_total)
+            print(f'        processing circles {start}:{end} ...')
+
+            mocs = MOC.from_cones(
+                lon=Longitude(table[colra][start:end], unit='deg'),
+                lat=Latitude(table[coldec][start:end], unit='deg'),
+                radius=Angle(table[colrad][start:end], unit='deg'),
+                max_depth=order, delta_depth=delta_depth, n_threads=n_threads)
+
+            #if not mocs: continue
+            hp_idx = np.concatenate([moc.flatten() for moc in mocs])
+            #if not hp_idx: continue
+            hp_idx = np.unique(hp_idx).astype(np.int64)
+
+            # Stream directly into the sparse map
+            stage.update_values_pix(hp_idx, True)
+
+            # be nice with memory
+            del hp_idx, mocs
+            gc.collect()
+
+        return
+
 
 
     @staticmethod
@@ -1245,7 +1394,7 @@ class SkyMaskPipe:
 
     def build_star_mask_online(self, starq, order_star: Optional[int] = None, order_cov: Optional[int] = None,
                                columns: Optional[Sequence[str]] = ['ra','dec','radius'],
-                               bit_packed: Optional[bool] = None, n_threads=4):
+                               bit_packed: Optional[bool] = None, n_threads=4, chunk_size=600_000):
         """
         Build a bright-star mask on the fly by querying a remote catalog.
 
@@ -1266,7 +1415,6 @@ class SkyMaskPipe:
               - ``cat`` : catalog identifier to open with `lsdb.open_catalog`.
               - ``columns`` : list of columns to load from the Gaia catalog.
               - ``gaia_gmag_lims`` : tuple ``(gmin, gmax)`` magnitude limits.
-              - ``gaia_b_lims`` : tuple ``(b_south, b_north)`` Galactic latitude cuts.
               - ``radfunction`` : callable that takes a DataFrame and assigns radii to stars.
             Optional keys:
               - ``max_area_single`` : maximum deg² before splitting (default 500).
@@ -1289,6 +1437,7 @@ class SkyMaskPipe:
         starmask : healsparse.HealSparseMap
             The star mask as a `HealSparseMap`, also stored as `self.starmask`
         """
+        from lsdb.core.search.moc_search import MOCSearch   # important import
 
         print('BUILDING STAR MASK >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
         if not(isinstance(starq, dict)): raise Exception("starq must be a valid dictionary")
@@ -1308,33 +1457,43 @@ class SkyMaskPipe:
         if not isinstance(search_stage, hsp.HealSparseMap):
             raise TypeError('search_stage must be a valid HealSparseMap')
 
-        # Build search MOC
+        # Build search MOC but degraded to MAX_DEPTH
         order_search_stg = int(np.log2(search_stage.nside_sparse))
         moc = MOC.from_healpix_cells(ipix=search_stage.valid_pixels, depth=order_search_stg, max_depth=MAX_DEPTH)
 
+
+        avoid_mw = starq['avoid_mw']
+        b0_deg = starq['b0_deg']
+        bulge_a_deg = starq['bulge_a_deg']
+        bulge_b_deg = starq['bulge_b_deg']
+        mwmessage = ''
+        # Create moc for the Milky Way at MAX_DEPTH and subtract
+        if avoid_mw:
+            print('--- Avoid Milky Way is ON')
+            moc_pb = SkyMaskPipe.gal_plane_bulge_moc(max_depth=MAX_DEPTH, b0_deg=b0_deg,
+                                                     bulge_a_deg=bulge_a_deg, bulge_b_deg=bulge_b_deg)
+            moc = moc.difference(moc_pb)
+            mwmessage = '(MW subtracted)'
+
         # Open Gaia (already filtered by columns/mag/lat outside MW plane)
-        gaia = lsdb.open_catalog(
-            starq['cat'],
-            columns=starq['columns'],
-            search_filter=lsdb.BoxSearch(ra=[0.,360.], dec=[-89.99999, 10.]),  # hardcode dec<10 for LSST
-            filters=[["phot_g_mean_mag", ">", starq['gaia_gmag_lims'][0]],
-                     ["phot_g_mean_mag", "<", starq['gaia_gmag_lims'][1]]]
-        )
-        bsouth, bnorth = starq['gaia_b_lims']
-        gaiat = gaia.query(f"(b < {bsouth}) or (b > {bnorth})")
+        gaia = lsdb.open_catalog(starq['cat'],
+                                columns=starq['columns'],
+                                search_filter=MOCSearch(moc),
+                                filters=[["phot_g_mean_mag", ">", starq['gaia_gmag_lims'][0]],
+                                        ["phot_g_mean_mag", "<", starq['gaia_gmag_lims'][1]]] )
 
         # Split moc parameters
-        max_area_sing     = starq.get('max_area_single',   500.0)
-        target_chunk_area = starq.get('target_chunk_area', 300.0)
+        max_area_sing     = starq.get('max_area_single',   800.0)
+        target_chunk_area = starq.get('target_chunk_area', 800.0)
         coarse_order_bfs  = starq.get('coarse_order_bfs',  5)
 
         # Get chunks (or a single piece)
         moc_area = getarea_moc(moc)
         if moc_area < max_area_sing:
-            print(f'Area of search_stage is {moc_area:.2f} deg2 -> no splitting')
+            print(f'Area of search_stage {mwmessage} is {moc_area:.2f} deg2 -> no splitting')
             chunk_mocs = [moc.add_neighbours()]  # 1px border at max depth
         else:
-            print(f'Area of search_stage is {moc_area:.2f} deg2 -> splitting...')
+            print(f'Area of search_stage {mwmessage} is {moc_area:.2f} deg2 -> splitting...')
             chunk_mocs = split_moc_into_chunks(moc, target_deg2=target_chunk_area, coarse_order=coarse_order_bfs)
             # refine to original depth + add border
             chunk_mocs = [c.intersection(moc).add_neighbours() for c in chunk_mocs]
@@ -1347,30 +1506,22 @@ class SkyMaskPipe:
         if not callable(radfunction):
             raise TypeError("radfunction must be a callable that accepts a DataFrame with optional kwargs")
 
-        # ---- STREAMING PIPELINE ----
+        # MOC STREAMING PIPELINE ---------------
         for i, mi in enumerate(chunk_mocs, 1):
-            print(f'Chunk {i}/{len(chunk_mocs)}: querying URL catalog ...')
+            print(f'Chunk {i}/{len(chunk_mocs)}: querying catalog ...')
             # Get stars in this chunk only
-            s = gaiat.moc_search(moc=mi).compute()
+            s = gaia.moc_search(moc=mi).compute()
+            print(f'--- Stars found : {len(s)}')
 
             # Add radii in-place
             radfunction(s)
 
-            # Pixelate *this chunk only*
-            pix = self.pixelate_circles(s, order=order_sparse, columns=columns, n_threads=n_threads)
-            if pix is None or len(pix) == 0:
-                continue
-
-            # Optional (small) per-chunk de-dup to reduce work:
-            # cheaper than global unique, and bounded in size
-            pix = np.asarray(pix, dtype=np.int64)
-            pix = np.unique(pix)
-
-            # Stream directly into the sparse map (idempotent)
-            self.starmask.update_values_pix(pix, True)
+            # Pixelate this moc_chunk
+            self.pixelate_circles(s, self.starmask, order=order_sparse, columns=columns,
+                                  n_threads=n_threads, chunk_size=chunk_size)
 
             # Free memory promptly
-            del s, pix
+            del s
             gc.collect()
 
         # Force packing if desired
@@ -1384,7 +1535,8 @@ class SkyMaskPipe:
         self._store_params('starmask',
             starq=starq,
             order_star=order_sparse, order_cov=ord_cov, columns=columns, bit_packed=bit_packed,
-            n_threads=n_threads, pixels=npix, area_deg2=area_deg2)
+            n_threads=n_threads, chunk_size=chunk_size, avoid_mw=avoid_mw, b0_deg=b0_deg,
+            bulge_a_deg=bulge_a_deg, bulge_b_deg=bulge_b_deg, pixels=npix, area_deg2=area_deg2)
 
         print('--- Star mask area                         :', area_deg2)
         return self.starmask
@@ -1394,18 +1546,7 @@ class SkyMaskPipe:
     @staticmethod
     def reproject_nside_coverage(hspmap, newcov):
         """
-        Change the nside_coverage of a healsparse map. Useful to bring boolean maps to a common coverage,
-        allowing logic combinations between them
-
-        Parameters
-        ----------
-        hsmap
-            Healsparse boolean map
-
-        Returns
-        -------
-        hsmap
-            Healsparse boolean map
+        OLDER METHOD TO CHANGE COVERAGE -> TO BE DECREPATED. Use change_cov_order() instead
         """
         oldcov = hspmap.nside_coverage
         # Get all sparse pixels with valid data
@@ -1445,7 +1586,8 @@ class SkyMaskPipe:
         Returns
         -------
         mask_map : HealSparseMap
-            Healsparse boolean map whose pixels meet all criteria
+            The boolean (or bit-packed) mask is stored at `self.propmask` and also
+            returned to prompt
         """
 
         print('BUILDING PROPERTY MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
@@ -1649,11 +1791,12 @@ class SkyMaskPipe:
             foot.update_values_pix(pixels, True, operation="or")
         return pd.DataFrame({"pxs": foot.valid_pixels})
 
+
     @staticmethod
     def _pixels_from_sources(sources, nside_foot: int, columns: Tuple[str, str], *,
                              mapping: bool, order_foot: int, order_cov: int) -> np.ndarray:
         """
-        Normalize inputs and return an array of pixel indices (nest scheme) for all sources.
+        For an input set of discrete sources, returns an array of pixel indices (nest scheme).
         Special-case is for HATS/lsdb with mapping=True to distribute the pixelization.
         """
         colra, coldec = columns
@@ -1712,7 +1855,8 @@ class SkyMaskPipe:
         Returns
         -------
         healsparse.HealSparseMap
-            Boolean footprint map
+            The boolean (or bit-packed) mask is stored at `self.footmask` and also
+            returned to prompt
         """
         columns = tuple(columns)
         # Check if user wants specific orders, otherwise get from defaults
@@ -1889,7 +2033,7 @@ class SkyMaskPipe:
         else:
             return msk
 
-    
+
     @staticmethod
     def subtract_boolmask(mask1, mask2, bit_packed: "Optional[bool]" = None):
         """
@@ -1925,13 +2069,10 @@ class SkyMaskPipe:
             return msk
 
 
-
-            
-
-    def plot(self, stage: str = "mask", nr: int = 100_000, s: float = 0.5, 
-             figsize: Union[Tuple[float, float], List[float]] = [12, 6], 
+    def plot(self, stage: str = "mask", nr: int = 100_000, s: float = 0.5,
+             figsize: Union[Tuple[float, float], List[float]] = [12, 6],
              clipra: Optional[Tuple[float, float]] = None, clipdec: Optional[Tuple[float, float]] = None,
-             plot_circles: Optional[Dict[str, Any]] = False, plot_boxes: Optional[Dict[str, Any]] = False, 
+             plot_circles: Optional[Dict[str, Any]] = False, plot_boxes: Optional[Dict[str, Any]] = False,
              ax: Optional[Axes] = None, **kwargs) -> Tuple[plt.Figure, Axes]:
         """
         Quickly visualize a mask stage by means of randoms points in an x-y plot (no WCS projection).
@@ -1967,7 +2108,7 @@ class SkyMaskPipe:
         ------------------------------
         Below are examples of dictionaries to specify the circles/boxes to overplot:
          - plot_circles = {'data':'path/to/circles.fits', 'fmt':'fits', 'columns':['ra','dec','radius']}
-         - plot_boxes = {'data':'path/to/boxes.csv', 'fmt':'csv', 'columns':['ra_c','dec_c','width', 'height']}        
+         - plot_boxes = {'data':'path/to/boxes.csv', 'fmt':'csv', 'columns':['ra_c','dec_c','width', 'height']}
         """
 
         # Choose stage based on its name in a pipeline
@@ -1983,7 +2124,7 @@ class SkyMaskPipe:
         if clipra: ax.set_xlim(clipra)
         if clipdec: ax.set_ylim(clipdec)
         clipra=ax.get_xlim()  ;  clipdec=ax.get_ylim()
-        
+
         if plot_circles:
             # Extract from dictionary
             dataloc = plot_circles['data']
@@ -2003,7 +2144,7 @@ class SkyMaskPipe:
             # Extract from dictionary
             dataloc = plot_boxes['data']
             fmt = plot_boxes['fmt']
-            ra_c, dec_c, width, height = plot_boxes['columns']            
+            ra_c, dec_c, width, height = plot_boxes['columns']
             # Read boxes and find boxes inside window
             boxes = Table.read(dataloc, format=fmt)
             boxes['corner_ra']=boxes[ra_c]-0.5*boxes[width]   # assume no box crosses 360 boundary
@@ -2021,11 +2162,11 @@ class SkyMaskPipe:
 
 
     def plot_srcs(self, ra: Union[Sequence[float], Any], dec: Union[Sequence[float], Any],
-                  center: Optional[SkyCoord] = None, fov: Optional[Angle] = None, frame: str = "icrs", 
-                  projection: str = "SIN", figsize: Tuple[float, float] = (10, 5), 
-                  ax: Optional[Axes] = None, wcs: Optional[WCS] = None, 
-                  show: bool = False, marker: str = ".", s: float = 0.5, color: str = "k", 
-                  edgecolor: str = "none", alpha: float = 0.5, zorder: int = 8, 
+                  center: Optional[SkyCoord] = None, fov: Optional[Angle] = None, frame: str = "icrs",
+                  projection: str = "SIN", figsize: Tuple[float, float] = (10, 5),
+                  ax: Optional[Axes] = None, wcs: Optional[WCS] = None,
+                  show: bool = False, marker: str = ".", s: float = 0.5, color: str = "k",
+                  edgecolor: str = "none", alpha: float = 0.5, zorder: int = 8,
                   label: Optional[str] = None, **scatter_kwargs: Any) -> Tuple[plt.Figure, Axes, WCS] :
         """
         Overlay sources on the current figure with WCS axes (or create one if needed).
@@ -2161,176 +2302,6 @@ class SkyMaskPipe:
             print(str(len(cat[idx])),'sources within',stage)
 
         return cat[idx]
-
-
-
-    # =========================
-    # ===== Helper Utils  =====
-    # =========================
-    @staticmethod
-    def _is_bool_dtype(dt):
-        import numpy as np
-        try:
-            return np.issubdtype(dt, np.bool_)
-        except Exception:
-            return False
-
-    def _assert_bool_map(self, m, name="map"):
-        if not self._is_bool_dtype(m.dtype):
-            raise TypeError(f"{name}: expected boolean HealSparseMap; got dtype={m.dtype!r}")
-
-    def _is_bit_packed(self, m) -> bool:
-        return bool(getattr(m, "is_bit_packed_map", False))
-
-    def _empty_like_geometry(self, *, nside_cov, nside_sparse, bit_packed: bool):
-        #import numpy as np, healsparse as hsp
-        return hsp.HealSparseMap.make_empty(
-            nside_coverage=int(nside_cov),
-            nside_sparse=int(nside_sparse),
-            dtype=np.bool_,
-            bit_packed=bool(bit_packed),
-        )
-
-    def _to_bit_packed(self, m):
-        """Return a bit-packed boolean map with the same geometry as m."""
-        self._assert_bool_map(m, "to_bit_packed")
-        return m if self._is_bit_packed(m) else m.as_bit_packed_map()
-
-    def _to_unpacked(self, m):
-        """Return an unpacked (byte-per-pixel) boolean map with the same geometry as m."""
-        self._assert_bool_map(m, "to_unpacked")
-        if not self._is_bit_packed(m):
-            return m
-        out = self._empty_like_geometry(
-            nside_cov=m.nside_coverage, nside_sparse=m.nside_sparse, bit_packed=False
-        )
-        vp = m.valid_pixels
-        if vp.size:
-            out.update_values_pix(vp, True, operation="replace")
-        return out
-
-    # ===========================================
-    # ===== Sparse (order) upgrade / degrade =====
-    # ===========================================
-    def upgrade_sparse_order(self, stage, new_order, *, max_children_batch: int = 20_000_000):
-        """
-        Increase nside_sparse to 2**new_order (NESTED). Output keeps the SAME packing as input.
-        True parents expand to ALL True children.
-        """
-        import numpy as np
-        self._assert_bool_map(stage, "upgrade_sparse_order")
-        src_packed = self._is_bit_packed(stage)
-
-        old_nside = int(stage.nside_sparse)
-        new_nside = int(1<<new_order)
-        if new_nside == old_nside:
-            return stage
-        if new_nside < old_nside:
-            raise ValueError("upgrade_sparse_order: target must be finer than current.")
-
-        # children per parent (NESTED): 4**Δorder
-        delta_order = int(new_order) - int(np.log2(old_nside))
-        if delta_order <= 0:
-            raise ValueError("upgrade_sparse_order: non-positive Δorder computed.")
-        r2 = 4**delta_order
-
-        out = self._empty_like_geometry(
-            nside_cov=stage.nside_coverage, nside_sparse=new_nside, bit_packed=src_packed
-        )
-        vp = stage.valid_pixels
-        if vp.size == 0:
-            return out
-
-        parents_per_batch = max(1, max_children_batch // r2)
-        off = np.arange(r2, dtype=np.int64)
-
-        for i0 in range(0, vp.size, parents_per_batch):
-            p = vp[i0:i0 + parents_per_batch].astype(np.int64)
-            base = p * r2
-            children = (base[:, None] + off).reshape(-1)
-            out.update_values_pix(children, True, operation="replace")
-
-        return out
-
-    def degrade_sparse_order(self, stage, new_order, *, max_parent_batch: int = 25_000_000):
-        """
-        Decrease nside_sparse to 2**new_order (NESTED). Output keeps the SAME packing as input.
-        Parent=True if ANY child=True (OR semantics).
-        """
-        import numpy as np
-        self._assert_bool_map(stage, "degrade_sparse_order")
-        src_packed = self._is_bit_packed(stage)
-
-        old_nside = int(stage.nside_sparse)
-        new_nside = int(1<<new_order)
-        if new_nside == old_nside:
-            return stage
-        if new_nside > old_nside:
-            raise ValueError("degrade_sparse_order: target must be coarser than current.")
-
-        delta_order = int(np.log2(old_nside)) - int(new_order)
-        if delta_order <= 0:
-            raise ValueError("degrade_sparse_order: non-positive Δorder computed.")
-        r2 = 4**delta_order  # children per parent to collapse
-
-        out = self._empty_like_geometry(
-            nside_cov=stage.nside_coverage, nside_sparse=new_nside, bit_packed=src_packed
-        )
-        vp = stage.valid_pixels
-        if vp.size == 0:
-            return out
-
-        for i0 in range(0, vp.size, max_parent_batch):
-            parents = (vp[i0:i0 + max_parent_batch] // r2).astype(np.int64)
-            # Dedup within batch to reduce writes
-            if parents.size:
-                parents = np.unique(parents)
-                out.update_values_pix(parents, True, operation="replace")
-
-        return out
-
-    # ==================================
-    # ===== Coverage NSIDE changer  =====
-    # ==================================
-    def change_nside_coverage(self, stage, new_order_cov):
-        """
-        Change nside_coverage to 2**new_order_cov. Output keeps the SAME packing as input.
-        """
-        self._assert_bool_map(stage, "change_nside_coverage")
-        src_packed = self._is_bit_packed(stage)
-
-        current_cov = int(stage.nside_coverage)
-        target_cov = int(1<<new_order_cov)
-        if target_cov == current_cov:
-            return stage
-
-        out = self._empty_like_geometry(
-            nside_cov=target_cov, nside_sparse=stage.nside_sparse, bit_packed=src_packed
-        )
-        vp = stage.valid_pixels
-        if vp.size:
-            out.update_values_pix(vp, True, operation="replace")
-        return out
-
-    # ==================================
-    # ===== One-shot stage regridding ===
-    # ==================================
-    def regrid_stage(self, stage, *, order_out: int, order_cov: int):
-        """
-        Return `stage` at (order_out, order_cov), preserving the stage's packing.
-        """
-        self._assert_bool_map(stage, "regrid_stage")
-
-        # 1) sparse order first
-        current_order = int(__import__("numpy").log2(stage.nside_sparse))
-        if current_order < order_out:
-            stage = self.upgrade_sparse_order(stage, order_out)
-        elif current_order > order_out:
-            stage = self.degrade_sparse_order(stage, order_out)
-
-        # 2) coverage order
-        stage = self.change_nside_coverage(stage, order_cov)
-        return stage
 
 
 
@@ -2642,7 +2613,6 @@ class SkyMaskPipe:
         return depth_res
 
 
-
     def plot_moc(self, stage, center=None, fov=None, clipra=None, clipdec=None, order_force=None,
                  frame='icrs', projection='SIN', figsize=(10, 5),
                  color='green', alpha=0.2, linewidth=1.0, label=None,
@@ -2697,12 +2667,12 @@ class SkyMaskPipe:
 
         # Crop pixels outside box to speed plotting, if requested
         if (clipra is not None and clipdec is not None):
-            print('Looking pixels inside clip box...')
+            print('Retrieving pixels inside clip box...')
             stream_pars = stream_pars or {}    # make sure we pass an empty dict al least
             pixels = self.pix_in_zone(stage, ra_min=clipra[0], ra_max=clipra[1],
                                       dec_min=clipdec[0], dec_max=clipdec[1], return_mode='array', **stream_pars)
         else:
-            print('Looking pixels...')
+            print('Retrieving pixels...')
             pixels = stage.valid_pixels
         print(f'Found {len(pixels)} pixels')
 
@@ -2721,7 +2691,7 @@ class SkyMaskPipe:
                 lon = ax.coords['ra']; lat = ax.coords['dec']
                 lon.set_format_unit(u.deg, decimal=True, show_decimal_unit=True)
                 lat.set_format_unit(u.deg, decimal=True, show_decimal_unit=True)
-                ax.set_xlabel("ra"); ax.set_ylabel("dec")
+                ax.set_xlabel("dec"); ax.set_ylabel("ra")
                 ax.grid(color="black", linestyle="dotted")
                 wcs = _wcs
                 created_context = True
@@ -2754,6 +2724,156 @@ class SkyMaskPipe:
         if show: plt.show()
         return fig, ax, wcs
 
+
+    @staticmethod
+    def moc_from_stage(stage, order_forced: int|None = None):
+        """
+        Get the MOC from a stage or healsparse map
+        """
+        # Choose stage based on input healsparse map or the name of stage in a pipeline
+        if hasattr(stage, 'valid_pixels'):
+            stage = stage
+        else:
+            stage = getattr(self, stage)
+
+        # Read pixels without care
+        print(f'Retrieveing {stage.n_valid} pixels...')
+        pixels = stage.valid_pixels
+
+        # Build MOC at chosen order
+        order_sparse = int(np.log2(stage.nside_sparse))
+        order  = order_forced if order_forced else order_sparse
+        print(f'Building MOC at order {order}...')
+        moc = MOC.from_healpix_cells(ipix=pixels, depth=order_sparse, max_depth=order)
+
+        return moc
+
+
+    @staticmethod
+    def add_moca(alwidget, stage, color: str = "red", opacity: float = 0.25,
+                 order_forced: int|None = None):
+        """
+        For a stage or healsparse mpa, build its MOC and add it to an existing aladin widget
+        """
+        # Build the MOC at the chosen order
+        moc = SkyMaskPipe.moc_from_stage(stage, order_forced=order_forced)
+
+        # Add the MOC, with good error reporting if it fails
+        try:
+            print('Adding MOC to widget...')
+            alwidget.add_moc(moc, color=color, opacity=float(opacity),
+                             fill=True, edge=True, fillColor=color)
+        except Exception as e:
+            # Build a concise diagnostic
+            tname = type(moc_input).__name__
+            preview = ""
+            try:
+                s = repr(moc_input)
+                preview = (s[:200] + ("..." if len(s) > 200 else ""))
+            except Exception:
+                preview = "<unrepr-able>"
+            raise RuntimeError(
+                "Failed to add the MOC overlay via ipyaladin.add_moc(...).\n"
+                f"- type(moc): {tname}\n"
+                f"- preview: {preview}\n"
+                "Hints:\n"
+                "  • If it's a file path, pass it as a string or pathlib.Path to a valid MOC (FITS/JSON) file.\n"
+                "  • If it's a URL, ensure it's directly fetchable and points to a MOC.\n"
+                "  • If it's a mocpy object, ensure mocpy is installed and versions are compatible.\n"
+            ) from e
+
+
+    def plot_moca(self, stage, color: str = "red", opacity: float = 0.25, colormap: str = "viridis",
+                  target: str = "268 -26", fov: float = 120.0, survey: str = "CDS/P/DM/I/355/gaiadr3",
+                  order_forced: int|None = None):
+        """
+        Create an ipyaladin widget, load a HiPS survey, overlay a MOC, and set display
+        customizations such as colormap and coordinate frame.
+
+        This function is intended as a convenience wrapper around ipyaladin's `Aladin` widget.
+
+        WARNING: this is experimental and can leave zombie processes in your browser/GPU. Close the
+        browser tab and start again if you find issues.
+
+        Parameters
+        ----------
+        stage : SkyMaskPipe stage or healsparse map
+            Name of stage or a boolean healsparse map
+        color : str, optional
+            CSS color for MOC overlay fill and edge. Default is ``"red"``.
+        opacity : float, optional
+            Opacity for the MOC fill, between 0 (transparent) and 1 (opaque).
+            Default is 0.25.
+        colormap : str, optional
+            Colormap to apply to the base HiPS survey (requires FITS tiles).
+            Examples: ``"viridis"``, ``"inferno"``, ``"rainbow"``.
+            Default is ``"viridis"``.
+        target : str, optional
+            Initial target position for the view. Can be ``"ra dec"`` in degrees,
+            an object name resolvable by Aladin Lite, or a coordinate string.
+            Default is the Galactic center, ``"268 -26"``.
+        fov : float, optional
+            Field of view in degrees. Must be positive. Default is 120.
+        survey : str, optional
+            HiPS survey identifier or base URL. Default is the Gaia DR3 density map,
+            ``"CDS/P/DM/I/355/gaiadr3"``.
+        order_forced : int, optional
+            Force maximum order of moc passed to the widget. If None, the moc is built
+            at the sparse order of the input stage. Default is None.
+
+        Returns
+        -------
+        ipyaladin.Aladin
+            The ipyaladin widget instance. The widget is also displayed.
+
+        Notes
+        -----
+        * This helper displays the widget immediately via IPython's `display`.
+          In a plain Python script, it will not render anything.
+
+        Examples
+        --------
+        >>> from mocpy import MOC
+        >>> moc = MOC.from_fits("example_moc.fits")
+        >>> al = plot_moca(moc, color="blue", opacity=0.4, colormap="inferno")
+        >>> # `al` is an ipyaladin.Aladin widget now visible in the notebook
+        >>> # Use add_moca() method to build a moc from a stage and add it
+        >>> # to an already existing widget
+        """
+        # Dependency check to detect if Aladin widget is installed
+        try:
+            from ipyaladin import Aladin
+        except Exception as e:
+            raise RuntimeError(
+                "ipyaladin is required but not installed. Install with:\n"
+                "  pip install ipyaladin\n"
+                "Also ensure JupyterLab/Notebook has ipywidgets enabled."
+            ) from e
+
+        try:
+            from IPython.display import display, Javascript
+        except Exception as e:
+            raise RuntimeError(
+                "This function must run inside IPython (JupyterLab/Notebook)."
+            ) from e
+
+        # Create and show widget
+        aladin = Aladin(target=str(target), fov=fov)
+        display(aladin)
+
+        # Load base survey, set colormap and frame
+        aladin.survey = survey
+        aladin.set_color_map(colormap)
+        aladin.set_trait("coo_frame", "ICRSd")
+
+        # Add the MOC, with good error reporting if it fails
+        self.add_moca(aladin, stage, color=color, opacity=opacity, order_forced=order_forced)
+
+        # Insist because sometimes these properties are not set
+        aladin.set_color_map(colormap)
+        aladin.set_trait("coo_frame", "ICRSd")
+
+        return aladin
 
 
     def _resolve_stage_input(self, stage):
@@ -2795,6 +2915,12 @@ class SkyMaskPipe:
         m = stage
         return "<map>", m
 
+
+    def _empty_like_geometry(self, *, nside_cov, nside_sparse, bit_packed: bool):
+        """Auxiliary method to create an empty healsparse map"""
+        return hsp.HealSparseMap.make_empty(
+            nside_coverage=int(nside_cov), nside_sparse=int(nside_sparse),
+            dtype=np.bool_, bit_packed=bool(bit_packed) )
 
 
     def combine(self, *, positive, negative=None, order_out: Optional[int] = None,
@@ -3167,8 +3293,6 @@ class SkyMaskPipe:
         return res
 
 
-
-
     def change_sparse_order(self, stage, order: int, *, inplace: bool = True, verbose: bool = True):
         """
         Change the sparse resolution for a boolean (or bit-packed boolean) stage or HealSparseMap,
@@ -3242,7 +3366,6 @@ class SkyMaskPipe:
         return out
 
 
-
     def change_cov_order(self, stage, order: int, *, inplace: bool = True, verbose: bool = True):
         """
         Change coverage order (nside_coverage) while preserving sparse resolution and bitpacking
@@ -3308,7 +3431,6 @@ class SkyMaskPipe:
         return out
 
 
-
     def build_circ_mask(self, data: Union[pd.DataFrame, str, Path] = None, order_circ: Optional[int] = None,
             order_cov: Optional[int] = None, fmt: str = 'ascii',
             columns: Optional[Sequence[str]] = ['ra','dec','radius'],
@@ -3345,8 +3467,8 @@ class SkyMaskPipe:
         Returns
         -------
         HealSparseMap
-            A boolean (or bit-packed) mask is both, stored at `self.circmask` and returned
-            to prompt
+            The boolean (or bit-packed) mask is stored at `self.circmask` and also
+            returned to prompt
         """
         print('BUILDING CIRCLES MASK >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
         # Check if user wants specific orders, otherwise get from defaults
@@ -3356,13 +3478,13 @@ class SkyMaskPipe:
         nside_sparse = 1<<order_sparse
         nside_cov = 1<<ord_cov
 
-        # Create the empty boolean map *up front*
+        # Create the empty boolean map up front
         self.circmask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_)
 
         # Perform pixelization
-        pix = self.pixelate_circles(data, fmt=fmt, order=order_sparse, columns=columns, n_threads=n_threads)
-        if pix is not None and len(pix) > 0:
-            self.circmask.update_values_pix(pix, True)
+        self.pixelate_circles(data, self.circmask, fmt=fmt, order=order_sparse, columns=columns, n_threads=n_threads)
+        #if pix is not None and len(pix) > 0:
+        #    self.circmask.update_values_pix(pix, True)
 
         # Force packing if desired
         if bit_packed: self.circmask = self.circmask.as_bit_packed_map()
@@ -3416,8 +3538,9 @@ class SkyMaskPipe:
         Returns
         -------
         HealSparseMap
-            A boolean (or bit-packed) mask is both, stored at `self.boxmask` and returned
-            to prompt
+            The boolean (or bit-packed) mask is stored at `self.boxmask` and also
+            returned to prompt
+
         """
         print('BUILDING BOXES MASK >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
         # Check if user wants specific orders, otherwise get from defaults
@@ -3449,7 +3572,6 @@ class SkyMaskPipe:
 
         print('--- Boxes mask area                           :', area_deg2)
         return self.boxmask
-
 
 
     def build_ellip_mask(self, data: Union[pd.DataFrame, str, Path] = None, order_ellip: Optional[int] = None,
@@ -3559,8 +3681,8 @@ class SkyMaskPipe:
         Returns
         -------
         HealSparseMap
-            A boolean (or bit-packed) mask is both, stored at `self.polymask` and returned
-            to prompt
+            The boolean (or bit-packed) mask is stored at `self.polymask` and also
+            returned to prompt
         """
 
         print('BUILDING POLYGON MASK >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
@@ -3593,7 +3715,6 @@ class SkyMaskPipe:
 
         print('--- Polygon mask area                           :', area_deg2)
         return self.polymask
-
 
 
     def build_zone_mask(self, data: Union[pd.DataFrame, str, Path] = None,
@@ -3630,8 +3751,8 @@ class SkyMaskPipe:
         Returns
         -------
         HealSparseMap
-            A boolean (or bit-packed) mask is both, stored at `self.zonemask` and returned
-            to prompt
+            The boolean (or bit-packed) mask is stored at `self.circmask` and also
+            returned to prompt
 
         Notes
         -----
@@ -3673,4 +3794,363 @@ class SkyMaskPipe:
 
         print('--- Zones mask area                           :', area_deg2)
         return self.zonemask
+
+
+
+    def moc_from_stage_streaming(self, stage, order_forced: int | None = None,
+                                 rows_per_batch: int = 2048,   # how many coverage rows per micro-MOC
+                                 reduce_every: int = 16         # union-reduce frequency
+                                 ) -> MOC:
+        """
+        Build a MOC from a (possibly bit-packed) healsparse map WITHOUT materializing
+        all valid pixels at once.
+
+        Uses your `_iter_valid_by_covpix(hspmap)` which yields (covpix, arr) per coverage row.
+        We:
+          • coarsen each row's sparse-order pixels to the desired target order
+          • unique within the row (cheap)
+          • accumulate parent ipix for `rows_per_batch` rows → build a tiny MOC
+          • periodically union-reduce partial MOCs to keep memory bounded
+        """
+        from math import log2
+        # Resolve stage -> healsparse map
+        hsp = stage if hasattr(stage, 'nside_sparse') else getattr(self, stage)
+
+        order_sparse = int(round(log2(hsp.nside_sparse)))
+        order_target = order_forced if order_forced is not None else order_sparse
+        if order_target > order_sparse:
+            raise ValueError(f"order_target ({order_target}) > order_sparse ({order_sparse})")
+
+        # child → parent factor in NESTED scheme
+        delta = order_sparse - order_target
+        parent_factor = 4 ** delta if delta > 0 else 1
+
+        # Streaming accumulators
+        micro_ipix = []   # list of np.ndarray[int64] at target order
+        partials = []     # list of tiny MOCs to union later
+        row_counter = 0
+
+        # --- main streaming loop (YOUR iterator signature) ---
+        for _covpix, arr in _iter_valid_by_covpix(hsp):
+            if arr is None or arr.size == 0:
+                continue
+
+            # ensure int64 without a copy when possible
+            arr = np.asarray(arr, dtype=np.int64, order='C')
+
+            # Coarsen immediately (order_sparse → order_target)
+            parents = (arr // parent_factor) if delta > 0 else arr
+
+            # Unique within the row (cheap, keeps the batch small)
+            if parents.size > 1 and (parents[1:] < parents[:-1]).any():
+                parents.sort()
+            parents = np.unique(parents)
+
+            # Accumulate
+            if parents.size:
+                micro_ipix.append(parents)
+                row_counter += 1
+
+            # Build a micro-MOC every rows_per_batch rows
+            if row_counter >= rows_per_batch:
+                ipix = np.unique(np.concatenate(micro_ipix)) if len(micro_ipix) > 1 else micro_ipix[0]
+                micro_ipix.clear()
+                row_counter = 0
+
+                m = MOC.from_healpix_cells(
+                    ipix=ipix,
+                    depth=order_target,      # all at the same order now
+                    max_depth=order_target
+                )
+                partials.append(m)
+
+                # Union-reduce to avoid long chains (binary-ish reduction)
+                while len(partials) >= 2:
+                    a = partials.pop()
+                    b = partials.pop()
+                    partials.append(a.union(b))
+
+        # Flush any remainder
+        if micro_ipix:
+            ipix = np.unique(np.concatenate(micro_ipix)) if len(micro_ipix) > 1 else micro_ipix[0]
+            micro_ipix.clear()
+            m = MOC.from_healpix_cells(ipix=ipix, depth=order_target, max_depth=order_target)
+            partials.append(m)
+
+        # Final reduction / empty case
+        if not partials:
+            return MOC.from_healpix_cells(
+                ipix=np.array([], dtype=np.int64),
+                depth=np.array([], dtype=np.int16),
+                max_depth=order_target
+            )
+
+        moc = partials[0]
+        for p in partials[1:]:
+            moc = moc.union(p)
+        return moc
+
+
+    @staticmethod
+    def _otsu_threshold(gray_0to255: np.ndarray) -> int:
+        # Auxliary for image_to_healsparse()
+        """
+        Return Otsu threshold (0..255) for a grayscale uint8 image. 0tsu method assumes the image
+        has two intensity classes (background vs foreground) and chooses the threshold that
+        best separates them by minimizing within-class variance.
+        """
+        hist = np.bincount(gray_0to255.ravel(), minlength=256).astype(np.float64)
+        p = hist / hist.sum()
+        omega = np.cumsum(p)
+        mu = np.cumsum(p * np.arange(256))
+        mu_t = mu[-1]
+        denom = omega * (1 - omega)
+        denom[denom == 0] = np.nan
+        sigma_b2 = (mu_t * omega - mu) ** 2 / denom
+        k = int(np.nanargmax(sigma_b2))
+        return k
+
+
+    @staticmethod
+    def _load_binary_mask(image_path: str, invert: bool = False, blur_radius: float = 0.0,
+                          threshold: int | None = None, expand_px: int = 0) -> np.ndarray:
+        # Auxliary for image_to_healsparse()
+        """
+        Load image -> grayscale -> (optional) blur -> threshold -> (optional) dilate.
+        Returns a boolean array mask[y, x] with True = "ink"/foreground.
+        """
+        from PIL import Image, ImageOps, ImageFilter
+
+        im = Image.open(image_path).convert("L")          # grayscale
+        im = ImageOps.autocontrast(im)                    # normalize a bit
+        if blur_radius and blur_radius > 0:
+            im = im.filter(ImageFilter.GaussianBlur(radius=float(blur_radius)))
+
+        arr = np.asarray(im, dtype=np.uint8)
+        if threshold is None:
+            thr = SkyMaskPipe._otsu_threshold(arr)
+        else:
+            thr = int(threshold)
+
+        if invert:
+            mask = arr < thr
+        else:
+            mask = arr >= thr
+
+        if expand_px and expand_px > 0:
+            # Simple morphological dilation using PIL’s MaxFilter
+            im_bin = Image.fromarray(mask.astype(np.uint8) * 255, mode="L")
+            im_dil = im_bin.filter(ImageFilter.MaxFilter(size=2*int(expand_px)+1))
+            mask = (np.asarray(im_dil) > 0)
+
+        return mask
+
+
+    @staticmethod
+    def _rotation(x, y, angle_deg: float):
+        # Auxliary for image_to_healsparse()
+        """Rotate 2D coordinates (x, y) by angle_deg (counterclockwise) in radians."""
+        if angle_deg == 0.0:
+            return x, y
+        a = np.deg2rad(angle_deg)
+        ca, sa = np.cos(a), np.sin(a)
+        xr = ca * x - sa * y
+        yr = sa * x + ca * y
+        return xr, yr
+
+
+    @staticmethod
+    def image_to_healsparse(image_path: str, *,
+        order_sparse: int = 9, order_cov: int = 4,
+        ra0_deg: float = 0.0, dec0_deg: float = 45.0,
+        width_deg: float = 30.0, height_deg: float | None = None,
+        rotation_deg: float = 0.0, invert: bool = False, blur_radius: float = 0.0,
+        threshold: int | None = None,    # 0..255; None = Otsu
+        expand_px: int = 0,              # dilate mask in pixels
+        samples_per_pix: int = 1,        # 1 or 4 (for thicker/anti-aliased edges)
+        edge_eps: float = 0.0,           # keep if inside OR within eps in plane units
+        chunk_size: int = 100_000, return_bit_packed: bool = False) -> hsp.HealSparseMap:
+        """
+        Rasterize an arbitrary image silhouette into a boolean HealSparseMap.
+
+        The image is mapped into a gnomonic (tangent-plane) patch centered on (ra0, dec0).
+        The on-sky size is ~width_deg × height_deg. Rotation is in the tangent plane.
+
+        Parameters
+        ----------
+        image_path : str
+            Path to the figure to draw (any format PIL can read).
+            Foreground (ink) will become True pixels in the map after thresholding.
+        order_sparse : int
+            HEALPix order (NESTED) for the sparse map (NSIDE=2**order_sparse).
+        order_cov : int
+            Coverage order; must satisfy order_sparse >= order_cov.
+        ra0_deg, dec0_deg : float
+            Center of the drawing in ICRS degrees.
+        width_deg, height_deg : float | None
+            Angular size of the drawing. If height_deg is None, it’s set by image aspect ratio.
+        rotation_deg : float
+            Rotation of the image (counterclockwise) in the tangent plane.
+        invert : bool
+            If True, invert the thresholded mask (useful if the background is dark).
+        blur_radius : float
+            Gaussian blur (px) before thresholding (helps noisy edges).
+        threshold : int | None
+            Manual threshold (0..255). If None, use Otsu.
+        expand_px : int
+            Morphological dilation in pixels after thresholding (thickens lines).
+        samples_per_pix : int
+            1 or 4. If 4, each HEALPix pixel center is sampled at 4 subpoints.
+        edge_eps : float
+            Extra acceptance band in tangent-plane units; 0.0 is typical.
+        chunk_size : int
+            How many sparse pixels to process per batch.
+        return_bit_packed : bool
+            If True, return a bit-packed boolean HealSparseMap.
+
+        Returns
+        -------
+        A healparse map with your favorite image printed!
+        """
+        if order_sparse < order_cov:
+            raise ValueError("order_sparse must be >= order_cov.")
+
+        # Load silhouette mask
+        mask = SkyMaskPipe._load_binary_mask(image_path, invert=invert,
+               blur_radius=blur_radius, threshold=threshold, expand_px=expand_px)
+        H, W = mask.shape
+
+        # Determine on-sky height from aspect ratio if not given
+        if height_deg is None: height_deg = width_deg * (H / W)
+
+        # Gnomonic geometry
+        nside_sparse = 2 ** order_sparse
+        nside_cov = 2 ** order_cov
+        dlevel = order_sparse - order_cov
+        child_factor = 4 ** dlevel
+
+        ra0 = np.deg2rad(ra0_deg % 360.0)
+        dec0 = np.deg2rad(dec0_deg)
+        sdec0, cdec0 = np.sin(dec0), np.cos(dec0)
+
+        # Scale: map sky box width/height to plane via tan
+        tx = np.tan(np.deg2rad(width_deg) / 2.0)
+        ty = np.tan(np.deg2rad(height_deg) / 2.0)
+
+        # A safe circular cap that contains the whole patch
+        half_diag = 0.5 * np.deg2rad(np.hypot(width_deg, height_deg))
+        cap_radius = min(np.deg2rad(89.0), half_diag * 1.05)
+
+        # Coverage candidates: centers within cap (with a small pad for coverage pixel size)
+        cov_area_deg2 = hp.nside2pixarea(nside_cov, degrees=True)
+        cov_radius_pad = np.deg2rad(np.sqrt(cov_area_deg2 / np.pi))
+
+        cov_npix = hp.nside2npix(nside_cov)
+        cov_pix = np.arange(cov_npix, dtype=np.int64)
+        theta_cov, phi_cov = hp.pix2ang(nside_cov, cov_pix, nest=True)
+        ra_cov = phi_cov
+        dec_cov = (np.pi/2.0) - theta_cov
+        dalpha_cov = (ra_cov - ra0 + np.pi) % (2*np.pi) - np.pi
+        cosg_cov = sdec0*np.sin(dec_cov) + cdec0*np.cos(dec_cov)*np.cos(dalpha_cov)
+        cosg_cov = np.clip(cosg_cov, -1.0, 1.0)
+        gamma_cov = np.arccos(cosg_cov)
+        cov_candidates = cov_pix[gamma_cov <= (cap_radius + cov_radius_pad)]
+
+        # Prepare sub-sampling offsets (in plane units) for anti-alias/thick edges if requested
+        if samples_per_pix == 4:
+            # Offsets are small fractions of plane scale
+            sub = np.array([[-0.25, -0.25], [+0.25, -0.25], [-0.25, +0.25], [+0.25, +0.25]])
+        else:
+            sub = np.array([[0.0, 0.0]])
+
+        valid_parts = []
+        for p in cov_candidates:
+            start = p * child_factor
+            stop = (p + 1) * child_factor
+
+            for base in range(start, stop, chunk_size):
+                end = min(base + chunk_size, stop)
+                child_idx = np.arange(base, end, dtype=np.int64)
+
+                theta, phi = hp.pix2ang(nside_sparse, child_idx, nest=True)
+                ra = phi
+                dec = (np.pi/2.0) - theta
+
+                # Pre-cut by the cap
+                dalpha = (ra - ra0 + np.pi) % (2*np.pi) - np.pi
+                cosg = sdec0*np.sin(dec) + cdec0*np.cos(dec)*np.cos(dalpha)
+                cosg = np.clip(cosg, -1.0, 1.0)
+                gamma = np.arccos(cosg)
+                m_cap = gamma <= cap_radius
+                if not np.any(m_cap):
+                    continue
+
+                ra = ra[m_cap]
+                dec = dec[m_cap]
+                dalpha = dalpha[m_cap]
+                idx_cap = child_idx[m_cap]
+
+                # Gnomonic projection
+                denom = sdec0*np.sin(dec) + cdec0*np.cos(dec)*np.cos(dalpha)
+                good = denom > 1e-12
+                if not np.any(good):
+                    continue
+
+                ra = ra[good]; dec = dec[good]; dalpha = dalpha[good]; idx_cap = idx_cap[good]
+                denom = denom[good]
+
+                x = (np.cos(dec) * np.sin(dalpha)) / denom
+                y = (cdec0*np.sin(dec) - sdec0*np.cos(dec)*np.cos(dalpha)) / denom
+
+                # Optional rotation in plane
+                x, y = SkyMaskPipe._rotation(x, y, rotation_deg)
+
+                # Normalize to image box
+                xn = x / tx
+                yn = y / ty
+
+                # Subsample (vectorized): accept if ANY subpoint falls inside the foreground
+                accept = np.zeros(xn.shape, dtype=bool)
+                for dx, dy in sub:
+                    xn_s = xn + (dx / (W if W>0 else 1))
+                    yn_s = yn + (dy / (H if H>0 else 1))
+
+                    # Map to pixel coords (u, v); note v grows downward
+                    u = (xn_s * 0.5 + 0.5) * W
+                    v = (-(yn_s) * 0.5 + 0.5) * H
+
+                    inside = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+                    if not np.any(inside):
+                        continue
+
+                    ui = u[inside].astype(np.int64)
+                    vi = v[inside].astype(np.int64)
+
+                    hit = np.zeros_like(inside)
+                    hit_idx = mask[vi, ui]
+                    hit[inside] = hit_idx
+
+                    if edge_eps > 0.0:
+                        # keep near-edges too: points slightly outside but within eps of box
+                        near = (~inside) & (np.abs(xn_s) <= 1.0 + edge_eps) & (np.abs(yn_s) <= 1.0 + edge_eps)
+                        hit |= near
+
+                    accept |= hit
+
+                if np.any(accept): valid_parts.append(idx_cap[accept])
+
+        valid_pixels = (np.unique(np.concatenate(valid_parts))
+                        if valid_parts else np.array([], dtype=np.int64))
+
+        hmap = hsp.HealSparseMap.make_empty(nside_coverage=2**order_cov,
+                                            nside_sparse=2**order_sparse, dtype=np.bool_)
+
+        if valid_pixels.size: hmap[valid_pixels] = True
+
+        print(f'Map generated from image -> valid pixels = {hmap.n_valid}')
+        return hmap.as_bit_packed_map() if return_bit_packed else hmap
+
+
+
+
 
