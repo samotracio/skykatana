@@ -9,7 +9,8 @@ from tqdm import tqdm
 import re, json, os, shutil, tempfile, fitsio, gc, math, threading
 from pathlib import Path, PosixPath
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Iterable, Tuple, Union, Optional, Any, Dict, Sequence
+from typing import Iterable, Tuple, Union, Optional, Any, Dict, Sequence, List
+from matplotlib.axes import Axes
 
 
 # Numba auxiliary kernels (compiled)
@@ -1854,7 +1855,7 @@ class SkyMaskPipe:
 
 
     @staticmethod
-    def intersect_boolmask(mask1, mask2, bit_packed=None):
+    def intersect_boolmask(mask1, mask2, bit_packed: "Optional[bool]" = None):
         """
         Intersect two arbitrary boolean masks in healsparse format.
 
@@ -1888,10 +1889,50 @@ class SkyMaskPipe:
         else:
             return msk
 
+    
+    @staticmethod
+    def subtract_boolmask(mask1, mask2, bit_packed: "Optional[bool]" = None):
+        """
+        Subtract two arbitrary boolean masks in healsparse format.
+
+        Parameters
+        ----------
+        mask1 : hsp_map
+            Healsparse boolean map 1
+        mask2 : hsp_map
+            Healsparse boolean map 2
+        bit_packed : bool
+            If True, returns ouput as a bit-packed boolean map
+
+        Returns
+        -------
+        hsp_map
+            Healsparse boolean map
+        """
+
+        if mask1.nside_sparse != mask2.nside_sparse:
+            raise Exception('Maps have different nside_sparse')
+
+        if mask1.nside_coverage != mask2.nside_coverage:
+            raise Exception('Maps have different nside_coverage')
+
+        msk = (mask1 & (~mask2))
+
+        # Preserve original packing
+        if bit_packed:
+            return msk.as_bit_packed_map()
+        else:
+            return msk
 
 
-    def plot(self, stage='mask', nr=100_000, s=0.5, figsize=[12,6], clipra=None, clipdec=None,
-            plot_stars=False, plot_boxes=False, ax=None, **kwargs):
+
+            
+
+    def plot(self, stage: str = "mask", nr: int = 100_000, s: float = 0.5, 
+             figsize: Union[Tuple[float, float], List[float]] = [12, 6], 
+             clipra: Optional[Tuple[float, float]] = None, clipdec: Optional[Tuple[float, float]] = None,
+             plot_circles: Optional[Dict[str, Any]] = False, plot_boxes: Optional[Dict[str, Any]] = False, 
+             ax: Optional[Axes] = None, **kwargs) -> Tuple[plt.Figure, Axes]:
         """
         Quickly visualize a mask stage by means of randoms points in an x-y plot (no WCS projection).
         Optionally plot circles and boxes to inspect areas masked by stars. If you need more precise
@@ -1913,14 +1954,20 @@ class SkyMaskPipe:
             Plot limits in ra, e.g. clipra=[226.5,227.5]
         clipdec : list of floats
             Plot limits in dec, e.g. clipdec=[10.,11.]
-        plot_stars : bool
-            Overlay circles due to bright stars
+        plot_circles : dict
+            Overlay circles due to bright stars if set to a dictionary as explained below
         plot_boxes : bool
-            Overlay boxes due to bright stars
+            Overlay boxes due to bright stars if set to a dictionary as explained below
         ax : axes
             If given, plot will be added to the axes object provided
         kwargs : kwargs
             Adittional keyword arguments passed to mataplolib.scatter()
+
+        Circles and boxes dictionaries
+        ------------------------------
+        Below are examples of dictionaries to specify the circles/boxes to overplot:
+         - plot_circles = {'data':'path/to/circles.fits', 'fmt':'fits', 'columns':['ra','dec','radius']}
+         - plot_boxes = {'data':'path/to/boxes.csv', 'fmt':'csv', 'columns':['ra_c','dec_c','width', 'height']}        
         """
 
         # Choose stage based on its name in a pipeline
@@ -1936,10 +1983,14 @@ class SkyMaskPipe:
         if clipra: ax.set_xlim(clipra)
         if clipdec: ax.set_ylim(clipdec)
         clipra=ax.get_xlim()  ;  clipdec=ax.get_ylim()
-
-        if plot_stars:
-            stars = Table.read(self.star_regs, format=self.star_regs_fmt)
-            colra, coldec, colrad = self.star_regs_columns
+        
+        if plot_circles:
+            # Extract from dictionary
+            dataloc = plot_circles['data']
+            fmt = plot_circles['fmt']
+            colra, coldec, colrad = plot_circles['columns']
+            # Read stars and find those inside window
+            stars = Table.read(dataloc, format=fmt)
             idx = (stars[colra]>clipra[0]) & (stars[colra]<clipra[1]) & (stars[coldec]>clipdec[0]) & (stars[coldec]<clipdec[1])
             ts = stars[idx]
             for i in range(len(ts)):
@@ -1949,12 +2000,14 @@ class SkyMaskPipe:
                 #print(i, (ts[colra][i], ts[coldec][i]), ts[colrad][i])
 
         if plot_boxes:
-            # Read boxes to overplot
-            boxes = Table.read(self.box_regs, format=self.box_regs_fmt)
-            ra_c, dec_c, width, height = self.box_regs_columns
+            # Extract from dictionary
+            dataloc = plot_boxes['data']
+            fmt = plot_boxes['fmt']
+            ra_c, dec_c, width, height = plot_boxes['columns']            
+            # Read boxes and find boxes inside window
+            boxes = Table.read(dataloc, format=fmt)
             boxes['corner_ra']=boxes[ra_c]-0.5*boxes[width]   # assume no box crosses 360 boundary
             boxes['corner_dec']=boxes[dec_c]-0.5*boxes[height]
-
             idxb = (boxes[ra_c]>clipra[0]) & (boxes[ra_c]<clipra[1]) & (boxes[dec_c]>clipdec[0]) & (boxes[dec_c]<clipdec[1])
             tsb = boxes[idxb]
             for i in range(len(tsb)):
@@ -1967,11 +2020,13 @@ class SkyMaskPipe:
         #if not(ax): plt.show()
 
 
-    def plot_srcs(self, ra, dec,
-                  center=None, fov=None, frame='icrs', projection='SIN',
-                  figsize=(10, 5), ax=None, wcs=None, show=False,
-                  marker='.', s=0.5, color='k', edgecolor='none',
-                  alpha=0.5, zorder=8, label=None, **scatter_kwargs):
+    def plot_srcs(self, ra: Union[Sequence[float], Any], dec: Union[Sequence[float], Any],
+                  center: Optional[SkyCoord] = None, fov: Optional[Angle] = None, frame: str = "icrs", 
+                  projection: str = "SIN", figsize: Tuple[float, float] = (10, 5), 
+                  ax: Optional[Axes] = None, wcs: Optional[WCS] = None, 
+                  show: bool = False, marker: str = ".", s: float = 0.5, color: str = "k", 
+                  edgecolor: str = "none", alpha: float = 0.5, zorder: int = 8, 
+                  label: Optional[str] = None, **scatter_kwargs: Any) -> Tuple[plt.Figure, Axes, WCS] :
         """
         Overlay sources on the current figure with WCS axes (or create one if needed).
 
