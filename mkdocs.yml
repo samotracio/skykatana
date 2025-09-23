@@ -13,34 +13,33 @@ nav:
   - API: api.md
 
 theme:
-  name: material #dracula #readthedocs
+  name: material
   logo: images/logo.png
   favicon: images/sword-cross-custom.png
   palette:
-    scheme: slate         # general color scheme
-    primary: blue grey    # top heading with title & search bar
-    accent: yellow        # hovering links
+    scheme: slate
+    primary: blue grey
+    accent: yellow
   font:
     text: Merriweather Sans
     code: Red Hat Mono
 
-
 plugins:
-- search:
-- mkdocstrings:
-    handlers:
-      python:
-      	paths: [src]
-        options:
-          show_root_heading: yes
-          docstring_style: numpy
-          docstring_section_style: table # or: table | spacy
-          summary: true
-          group_by_category: true
-          show_symbol_type_heading: true
-          show_symbol_type_toc: true
-          modernize_annotations: true
-          #show_docstring_description: true
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths:
+            - src      # <<— no tabs; pure spaces
+          options:
+            show_root_heading: true
+            docstring_style: numpy
+            docstring_section_style: table
+            summary: true
+            group_by_category: true
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            modernize_annotations: true
 
 extra_css:
   - css/mkdocstrings.css
@@ -48,7 +47,6 @@ extra_css:
   - css/overrides.css
   - css/notebook-styles.css
 
-# Optional: You can add mkdocstrings options to customize it
 markdown_extensions:
   - admonition
   - toc:
@@ -69,6 +67,6 @@ markdown_extensions:
   - attr_list
   - md_in_html
 
-extra:
-  python_path: "src"  # Add your src folder to the Python path
-
+# This 'extra' key is optional and not used by Material; safe to remove.
+# extra:
+#   python_path: "src"
