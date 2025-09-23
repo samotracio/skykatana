@@ -11,9 +11,10 @@ combined into a final mask.
 For each stage you can generate random points, quickly visualize masks, do plots overlaying
 bright stars, and apply the mask to an arbitrary catalog to select sources located inside.
 
-Although mainly designed to work with the [HSC-SSP survey](https://hsc-release.mtk.nao.ac.jp/doc/),
-it is flexible to accomodate other surveys such as the upcoming half-sky dataset of the
-[Vera Rubin Observatory](https://rubinobservatory.org/).
+It has been designed to produce masks for large 8-meter surveys such as the upcoming half-sky 
+dataset of the [Vera Rubin Observatory](https://rubinobservatory.org/) and the [HSC-SSP survey](https://hsc-release.mtk.nao.ac.jp/doc/).
+It can handle multi-billion pixel masks with very limited memory resources and is flexible to 
+accomodate custom recipes for masking different objects.
 
 Main Class
 -------------
@@ -22,14 +23,14 @@ Main Class
 
 Main Methods
 -------------
-* ``build_footprint_mask(), build_patch_mask(), build_holes_mask(), buld_propmap_mask(), etc``
-    --> Generate maps for each stage
-* ``combine_mask()``
-    --> Merge the maps created above to generate a final mask
+* ``build_footprint_mask(), build_circ_mask(), buld_propmap_mask(), build_star_mask_online(), etc``
+    --> Generate maps for each stage from discrete sources, geometric shapes or other healsparse maps
+* ``combine()``
+    --> Merge the maps created above to generate a new mask
 * ``plot()``
     --> Visualize a mask stage by plotting randoms. Options to zoom, oveplot stars, etc.
-* ``plot2compare()``
-    --> Compare input sources on the left and a mask stage on the right
+* ``plot_moc()``
+    --> Visualize a mask stage by plotting its MOC (multiorder coverage map).
 * ``makerans()``
     --> Generate randoms over a mask stage
 * ``apply()``
@@ -38,13 +39,18 @@ Main Methods
 Dependencies
 ------------
 * [lsdb](https://github.com/astronomy-commons/lsdb), [healsparse](https://github.com/LSSTDESC/healsparse),
-[tqdm](https://github.com/tqdm/tqdm), [healpy](https://github.com/healpy/healpy)
+[tqdm](https://github.com/tqdm/tqdm), [healpy](https://github.com/healpy/healpy), [fitsio](https://github.com/esheldon/fitsio), 
+[ipyaladin](https://github.com/cds-astro/ipyaladin), [pillow](https://github.com/python-pillow/Pillow)
 
 Install
 -------
 There are two ways to get skykatana:
-1. `pip install skykatana`
-2. Clone the repo, switch to the pacakge directory and do `pip install .` . This has the advantage that you will
+
+* `pip install skykatana`
+
+or 
+
+* Clone the repo, switch to the pacakge directory and do `pip install .`&nbsp; This has the advantage that you will
 get the latest version and example notebooks.
 
 Example Dataset
@@ -54,9 +60,14 @@ There a small dataset of ~8 million HSC sources to start using the package. Get 
 
 Documentation
 -------------
-* A quick introductory notebook is availables [here](https://github.com/samotracio/skykatana/blob/main/notebooks/quick_example_hsc.ipynb)
-* An indepth tutorial notebook can be found [here](https://github.com/samotracio/skykatana/blob/main/notebooks/indepth_usage.ipynb)
-* The full documentation is available [here](https://skykatana.readthedocs.io/en/latest/)
+* A quick tutorial notebook with HSC data is available [here](https://github.com/samotracio/skykatana/blob/main/notebooks/quick_example_hsc.ipynb)
+* A tutorial notebook for building Rubin masks can be found [here](https://github.com/samotracio/skykatana/blob/main/notebooks/quick_example_rubin.ipynb)
+* The full documentation and API is available [here](https://skykatana.readthedocs.io/en/latest/)
+
+Gallery
+-------
+![png](docs/images/gallery1.png)
+![png](docs/images/gallery2.png)
 
 Credits
 -------
@@ -66,5 +77,5 @@ Credits
 
 Acknowledgements
 ----------------
-This software was partially developed with the generous support of the [LINCC Frameworks Incubator Program](https://lsstdiscoveryalliance.org/programs/lincc-frameworks/incubators/) using LINCC resources. The [healsparse](https://github.com/LSSTDESC/healsparse) code was written by Eli Rykoff and Javier Sanchez
+This software was partially developed with the generous support of the [LINCC Frameworks Incubator Program](https://lsstdiscoveryalliance.org/programs/lincc-frameworks/incubators/) using LINCC resources. The [healsparse](https://github.com/LSSTDESC/healsparse) code was written by Eli Rykoff and Javier Sanchez. [mocpy](https://github.com/cds-astro/mocpy) is a fantastic library developed by the mocpy team, and [ipyaladin](https://github.com/cds-astro/ipyaladin) is a great tool to enable interactive sky visualizations.
 

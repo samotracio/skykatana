@@ -10,7 +10,11 @@ import re, json, os, shutil, tempfile, fitsio, gc, math, threading
 from pathlib import Path, PosixPath
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable, Tuple, Union, Optional, Any, Dict, Sequence, List
+from numpy.typing import NDArray
 from matplotlib.axes import Axes
+from healsparse import HealSparseMap
+from matplotlib.figure import Figure
+from numpy.random import RandomState
 # Supress info msgs from dask -> distributed.core INFO: Event loop was unresponsive in Nanny ...
 # which repeats a lot during pixelization of circles
 import logging
@@ -560,58 +564,36 @@ def split_moc_into_chunks(moc: MOC,
 #####################################################################
 class SkyMaskPipe:
     """
-    A class to work with healsparse sky masks in a pipeline way
+    SkyMaskPipe is a class to work with boolean sky masks in a pipeline way
 
     Attributes
     ----------
     order_cov : int
-        Coverage order of (all) healsparse maps.
-    order_foot : int
-        Order for the footprint map
-    order_patch : int
-        Order for the patch map
-    order_prop : int
-        Order for the property map
-    order_star : int
-        Order for the bright star mask (queried from online catalog)
+        Default coverage order of (all) healsparse maps.
+    order_out : int
+        Default sparse order of combining healsparse maps.
     """
 
     # Class scalar attributes to be saved in JSON file
-    _SCALAR_ATTRS = ["order_cov","order_foot","order_patch","order_prop","order_star",
-                     "order_circ", "order_box","order_ellip","order_poly","order_zone","order_out"]
+    _SCALAR_ATTRS = ["order_cov", "order_out"]
     _BITPACK_FITS_VERSION = 1   # File format version in case we update
 
-
+    
     def __init__(self, **kwargs):
-
         # Default values for orders, when not provided
-        defaults = {
-            'order_cov':       4,
-            'order_foot':      13,
-            'order_patch':     13,
-            'order_prop':      15,
-            'order_star':      15,
-            'order_circ':      15,
-            'order_box':       15,
-            'order_ellip':     15,
-            'order_poly':      15,
-            'order_zone':      15,
-            'order_out':       15
-        }
-
-        for (prop, val) in defaults.items():
-            setattr(self, prop, kwargs.get(prop, val))
-
+        self.order_out = kwargs.get('order_out', 15)
+        self.order_cov = kwargs.get('order_cov', 4)
         self.nside_out       = 1<<self.order_out
         self.nside_cov       = 1<<self.order_cov
         self.footmask        = None
-        self.propmap         = None
+        self.propmask        = None
         self.starmask        = None
         self.circmask        = None
         self.boxmask         = None
         self.ellipmask       = None
         self.polymask        = None
         self.zonemask        = None
+        self.mwmask          = None
         self.mask            = None
         self._params: Dict[str, Dict[str, Any]] = {}  # all stage params live here
 
@@ -652,7 +634,7 @@ class SkyMaskPipe:
         preferred = (
             "footmask", "patchmask", "propmask", "starmask",
             "circmask", "boxmask", "ellipmask", "polymask",
-            "zonemask", "mask",
+            "zonemask","mwmask", "mask",
         )
         rank = {n: i for i, n in enumerate(preferred)}
         found.sort(key=lambda kv: (rank.get(kv[0], 999), kv[0]))
@@ -693,19 +675,54 @@ class SkyMaskPipe:
     __repr__ = __str__
     ###########################
 
+    
+    def _finalize_stage(self, hspmap, *, default_name: str, output_stage: Optional[str] = None, 
+                        extra_meta: Optional[dict] = None):
+        """Attach a  map as a stage and record standardized metadata. Overwrite canonical when output_stage is None."""
+        # extra_meta : pass here the dict associated to the map that you want to store/updata
+        import math
+        name = (output_stage or default_name).strip()
+        if not name.endswith("mask"):
+            raise ValueError("Stage names must end with 'mask'.")
+        if not name.isidentifier():
+            raise ValueError(f"Invalid Python identifier for stage name: {name!r}")
+        setattr(self, name, hspmap)
+        if not hasattr(self, "_params") or self._params is None:
+            self._params = {}
+        nside_sparse = getattr(hspmap, "nside_sparse", None)
+        nside_cov    = getattr(hspmap, "nside_coverage", None)
+        order_sparse   = int(math.log2(nside_sparse)) if nside_sparse else None
+        order_coverage = int(math.log2(nside_cov))    if nside_cov   else None
+        meta = {
+            "nside_sparse": nside_sparse,
+            "nside_coverage": nside_cov,
+            "order_sparse": order_sparse,
+            "order_coverage": order_coverage,
+        }
+        if extra_meta:
+            try:
+                meta.update(extra_meta)
+            except Exception:
+                meta["extra"] = repr(extra_meta)
+        self._params[name] = meta
+        return hspmap
 
-    def _store_params(self, stage: str, **params: Any) -> None:
-        """
-        Generic helper to stash params for any stage
-        """
-        def _norm(v):
-            if isinstance(v, (str, Path)):       # normalize paths & strings
-                return str(v)
-            if isinstance(v, list):              # lists → tuples for immutability-ish logs
-                return tuple(v)
-            return v
-        packed = {k: _norm(v) for k, v in params.items()}
-        self._params.setdefault(stage, {}).update(packed)
+    
+    def stage_meta(self, name: str) -> dict:
+        """Return the metadata associated to a given stage"""
+        return dict(self._params.get(name, {}))
+
+    
+    def stage_orders(self, name: str):
+        """Return the (order_sparse, order_coverage) of a given stage"""
+        import math
+        h = getattr(self, name, None)
+        if h is not None:
+            os_ = int(math.log2(getattr(h, "nside_sparse", 1))) if getattr(h, "nside_sparse", None) else None
+            oc_ = int(math.log2(getattr(h, "nside_coverage", 1))) if getattr(h, "nside_coverage", None) else None
+            return os_, oc_
+        m = self._params.get(name, {})
+        return m.get("order_sparse"), m.get("order_coverage")
 
 
     def write(self, outdir: str | os.PathLike, overwrite: bool = True,
@@ -897,7 +914,7 @@ class SkyMaskPipe:
 
 
     @staticmethod
-    def readQApatches(qafile):
+    def readQApatches(qafile : str):
         """
         Read contents of HSC QA patch list.
 
@@ -919,7 +936,7 @@ class SkyMaskPipe:
 
 
     @staticmethod
-    def parse_condition(condition_str):
+    def parse_condition(condition_str : str):
         """
         Parses a condition string, converting column names into a format usable for direct evaluation over an astropy table.
         For example, converts "(ra>20) and (dec<30)" into "(table['ra']>20) & (table['dec']<30)".
@@ -948,7 +965,8 @@ class SkyMaskPipe:
 
 
     @staticmethod
-    def filter_and_pixelate_patches(file, qatable, filt=None, order=13):
+    def filter_and_pixelate_patches(file: str | os.PathLike[str], qatable : Table, 
+                                    filt: Optional[str] = None, order : int = 13) -> NDArray[np.int64]:
         """
         Reads a file with HSC patches, matches it against the QA table containing quality measures
         of each patch, filter those that meet some depth/seeing/etc critera, and return their
@@ -963,11 +981,11 @@ class SkyMaskPipe:
             HSC patch file (defult parquet, but anything astropy can read)
         qatable : astropy table
             Table of patches with QA measurements
-        order : int
-            Pixelization order
         filt : str
             Contition(s) to apply to patches, e.g filt='(ra>20) and (dec<10)'. If None,
             all patches will be considered
+        order : int
+            Pixelization order
 
         Returns
         -------
@@ -1086,59 +1104,14 @@ class SkyMaskPipe:
         return hsmap
 
 
-    @staticmethod
-    def BAKpixelate_circles(data, fmt='ascii', columns=['ra', 'dec', 'radius'], order=15,
-                            delta_depth=2, n_threads=4):
-        """
-        Read circular regions around bright stars, pixelize them and return the (unique) pixels inside.
-        Coordinates and distances should be in degrees.
-
-        Parameters
-        ----------
-        data : pd.Dataframe or str or Path
-            Pandas dataFrame or path to file
-        fmt : str
-            Format of file, e.g. 'ascii', 'parquet', or any accepted by astropy.table
-        columns : list of str
-            Colums for ra, dec, radius of circles
-        order : int
-            Pixelization order
-        delta_depth : int
-            Delta to higher orders to improve pixelization
-        n_threads : int
-            Number of threads. Set to None to use all available threads
-
-        Returns
-        -------
-        ndarray
-            Array of pixels
-        """
-        colra, coldec, colrad = columns
-        if isinstance(data, pd.DataFrame):
-            print('--- Pixelating circles from DataFrame')
-            table = data
-        elif isinstance(data, (str, PosixPath)):
-            print('--- Pixelating circles from', data)
-            table = Table.read(data, format=fmt)
-        print('    Order ::',order)
-
-        print('    getting mocs from cones...')
-        mocs = MOC.from_cones(
-            lon=Longitude(table[colra], unit='deg'), lat=Latitude(table[coldec], unit='deg'), radius=Angle(table[colrad], unit='deg'),
-            max_depth=order, delta_depth=delta_depth, n_threads=n_threads)
-
-        print('    flattening + concatenating...')
-        hp_index = np.concatenate([moc.flatten() for moc in mocs])
-        print('    done')
-        print('    uniquing+type64')
-        return np.unique(hp_index).astype(np.int64)
-
 
     @staticmethod
-    def pixelate_circles(data, stage, fmt='ascii', columns=('ra','dec','radius'),
-                         order=15, delta_depth=2, n_threads=1, chunk_size=600_000):
+    def pixelate_circles(data: Union[pd.DataFrame, str, os.PathLike[str]], stage : HealSparseMap, fmt: str = "ascii", 
+                         columns: Sequence[str] = ("ra", "dec", "radius"), order: int = 15, delta_depth: int = 2, 
+                         n_threads: int = 1, chunk_size: int = 600_000) -> None:
         """
-        Pixelize many circles into HEALPix indices and return unique pixels as a NumPy array.
+        Pixelize many circles into HEALPix indices and update the corresponding 
+        pixels of a given input stage.
         """
         colra, coldec, colrad = columns
         if isinstance(data, pd.DataFrame):
@@ -1178,10 +1151,11 @@ class SkyMaskPipe:
 
         return
 
-
-
+    
     @staticmethod
-    def pixelate_ellipses(data, fmt='ascii', columns=['ra','dec','a','b','pa'], order=15, delta_depth=2):
+    def pixelate_ellipses(data: Union[pd.DataFrame, str, os.PathLike[str]], fmt: str = "ascii", 
+                          columns: Sequence[str] = ("ra", "dec", "a", "b", "pa"), 
+                          order: int = 15, delta_depth: int = 2) -> NDArray[np.int64]:
         """
         Read elliptical regions around extended sources, pixelize them and return the (unique)
         pixels inside. Coordinates and distances should be in degrees.
@@ -1225,9 +1199,11 @@ class SkyMaskPipe:
         print('    done')
         return np.unique(hp_index).astype(np.int64)
 
-
+ 
     @staticmethod
-    def pixelate_boxes(data, fmt='ascii', columns=['ra_c','dec_c','width','height'], order=15, n_threads=4):
+    def pixelate_boxes(data: Union[pd.DataFrame, str, os.PathLike[str]], fmt: str = "ascii", 
+                       columns: Sequence[str] = ("ra_c", "dec_c", "width", "height"), 
+                       order: int = 15, n_threads: int = 4):
         """
         Read box regions around bright stars, pixelize them and return the (unique) pixels inside.
         Coordinates and distances should be in degrees.
@@ -1278,10 +1254,12 @@ class SkyMaskPipe:
         hp_index = np.concatenate([moc.flatten() for moc in mocs])
         print('    done')
         return np.unique(hp_index).astype(np.int64)
-
+    
 
     @staticmethod
-    def pixelate_zones(data, fmt='ascii', columns=['ra1','dec1','ra2','dec2'], order=15):
+    def pixelate_zones(data: Union[pd.DataFrame, str, os.PathLike[str]], fmt: str = "ascii", 
+                       columns: Sequence[str] = ("ra1", "dec1", "ra2", "dec2"), 
+                       order: int = 15) -> NDArray[np.int64]:
         """
         Read zone regions, pixelize them and return the (unique) pixels inside. Zones are
         regions delimited by ra/dec boundaries that follow great circles along ra and
@@ -1332,11 +1310,12 @@ class SkyMaskPipe:
         print('    done')
         return hp_index
 
-
+    
 
     @staticmethod
-    def pixelate_polys(data, fmt='ascii', columns=['ra0','ra1','ra2','ra3','dec0','dec1','dec2','dec3'],
-                       n_threads=4, order=15):
+    def pixelate_polys(data: Union[pd.DataFrame, str, os.PathLike[str]], fmt: str = "ascii", 
+                       columns: Sequence[str] = ("ra0", "ra1", "ra2", "ra3", "dec0", "dec1", "dec2", "dec3"),
+                       n_threads: int = 4, order: int = 15) -> NDArray[np.int64]:
         """
         Read quadrangular polygons, pixelize them and return the (unique) pixels inside.
         Input data must have 8 columns for the coordinates of the 4 vertices.
@@ -1392,9 +1371,10 @@ class SkyMaskPipe:
 
 
 
-    def build_star_mask_online(self, starq, order_star: Optional[int] = None, order_cov: Optional[int] = None,
-                               columns: Optional[Sequence[str]] = ['ra','dec','radius'],
-                               bit_packed: Optional[bool] = None, n_threads=4, chunk_size=600_000):
+    def build_star_mask_online(self, starq, order_sparse: int = 15, order_cov: Optional[int] = None,
+                               columns: Optional[Sequence[str]] = ['ra','dec','radius'], save_stars: bool = False,
+                               bit_packed: bool = True, n_threads: int = 4, chunk_size: int = 600_000, 
+                               output_stage: Optional[str] = None, mwmask_output_stage: Optional[str] = None):
         """
         Build a bright-star mask on the fly by querying a remote catalog.
 
@@ -1403,53 +1383,65 @@ class SkyMaskPipe:
         (2) querying the Gaia catalog in chunks of sky defined by a MOC,
         (3) applying a custom radius function to compute star exclusion radii,
         (4) pixelizing the stars into HEALPix pixels at the requested order,
-        and (5) streaming results directly into a sparse mask. The final mask
-        is stored in the `starmask` attribute.
+        and (5) streaming results directly into a sparse mask. By default, the 
+        final mask is stored in the `starmask` attribute.
 
         Parameters
         ----------
         starq : dict
             Dictionary of parameters controlling the star mask construction.
             Required keys:
+            
               - ``search_stage`` : `HealSparseMap` defining the search region.
               - ``cat`` : catalog identifier to open with `lsdb.open_catalog`.
               - ``columns`` : list of columns to load from the Gaia catalog.
               - ``gaia_gmag_lims`` : tuple ``(gmin, gmax)`` magnitude limits.
               - ``radfunction`` : callable that takes a DataFrame and assigns radii to stars.
+              
             Optional keys:
+            
               - ``max_area_single`` : maximum deg² before splitting (default 500).
               - ``target_chunk_area`` : target deg² per MOC chunk (default 300).
               - ``coarse_order_bfs`` : order for initial chunk splitting (default 5).
-        order_star : int, optional
-            Sparse order for pixelizing stars. Defaults to `self.order_star`.
+              
+        order_sparse : int, optional
+            Sparse order for pixelizing circles due to stars.
         order_cov : int, optional
             Coverage order. Defaults to `self.order_cov`.
         columns : sequence of str, optional
             Column names expected in the star DataFrame. Defaults to
             ``['ra', 'dec', 'radius']``.
+        save_stars : bool, default=False
+            If True, for each chunk piece save the retrieved stars (with radius column) in parquet format
         bit_packed : bool, optional
             If True, convert the final mask to bit-packed format.
         n_threads : int, default=4
             Number of threads used during circle pixelization.
+        chunk_size : int, default=600000
+            Number circles pixelized at once. Watch out memory if chunk_size and n_threads are both large
+        output_stage : str, optional
+            Name for the star ouput stage. If None, defaults to then canonical name 'starmask'
+        mwmask_output_stage : str, optional
+            Name for the Milky Way disc+bulge stage. If None, defaults to the canonical name "mkmask"
 
         Returns
         -------
         starmask : healsparse.HealSparseMap
-            The star mask as a `HealSparseMap`, also stored as `self.starmask`
+            The star mask as a `HealSparseMap`, also stored as `self.starmask` when `output_stage` is None
         """
-        from lsdb.core.search.moc_search import MOCSearch   # important import
+        from lsdb.core.search.moc_search import MOCSearch   # important import!
 
         print('BUILDING STAR MASK >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
         if not(isinstance(starq, dict)): raise Exception("starq must be a valid dictionary")
 
-        order_sparse = order_star if order_star is not None else self.order_star
+        # Check if user want different coverage order, otherwise get from defaults
         ord_cov = order_cov if order_cov is not None else self.order_cov
 
         nside_sparse = 1<<order_sparse
         nside_cov = 1<<ord_cov
 
         # Create the empty boolean map up front
-        self.starmask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_, bit_packed=True)
+        mask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_, bit_packed=True)
 
         MAX_DEPTH = 8     # The moc of the search_stage will be degraded to this order.
                           # 8 means 822" pixels, so is fine for including stars with up to ~411" radii
@@ -1461,13 +1453,12 @@ class SkyMaskPipe:
         order_search_stg = int(np.log2(search_stage.nside_sparse))
         moc = MOC.from_healpix_cells(ipix=search_stage.valid_pixels, depth=order_search_stg, max_depth=MAX_DEPTH)
 
-
+        # Create moc for the Milky Way at MAX_DEPTH and subtract
         avoid_mw = starq['avoid_mw']
         b0_deg = starq['b0_deg']
         bulge_a_deg = starq['bulge_a_deg']
         bulge_b_deg = starq['bulge_b_deg']
         mwmessage = ''
-        # Create moc for the Milky Way at MAX_DEPTH and subtract
         if avoid_mw:
             print('--- Avoid Milky Way is ON')
             moc_pb = SkyMaskPipe.gal_plane_bulge_moc(max_depth=MAX_DEPTH, b0_deg=b0_deg,
@@ -1512,36 +1503,50 @@ class SkyMaskPipe:
             # Get stars in this chunk only
             s = gaia.moc_search(moc=mi).compute()
             print(f'--- Stars found : {len(s)}')
-
             # Add radii in-place
             radfunction(s)
-
+            # Save stars to disk if requested
+            if save_stars:
+                fn = f"stars_chunk_{i:02d}.parquet"
+                s.to_parquet(fn)
+                print('---',fn, 'written to disk')
             # Pixelate this moc_chunk
-            self.pixelate_circles(s, self.starmask, order=order_sparse, columns=columns,
+            self.pixelate_circles(s, mask, order=order_sparse, columns=columns,
                                   n_threads=n_threads, chunk_size=chunk_size)
-
             # Free memory promptly
             del s
             gc.collect()
 
+        # Save mask for Milky Way is case the user might need to subtract it later
+        if avoid_mw:
+            mwmask = self._empty_like_geometry(nside_cov=nside_cov, nside_sparse=1<<MAX_DEPTH, bit_packed=False)
+            pixels = moc_pb.flatten().astype(np.int64)
+            mwmask.update_values_pix(pixels, True)
+            #print(f'Milky Way mask stored in stage -> mwmask')       # fix this message
+
         # Force packing if desired
-        if bit_packed: self.starmask = self.starmask.as_bit_packed_map()
+        if bit_packed:
+            mask = mask.as_bit_packed_map()
+            mwmask = mwmask.as_bit_packed_map()
 
         # Store calling/useful info in its own dictionary
-        area_deg2 = self.starmask.get_valid_area(degrees=True)
-        npix = self.starmask.n_valid
+        area_deg2 = mask.get_valid_area(degrees=True)
+        npix = mask.n_valid
         starq['search_stage'] = '<dummy>'  # for now just set a dummy string for the search_stage to avoid
                                            # storing the actual map. We should fix this later
-        self._store_params('starmask',
-            starq=starq,
-            order_star=order_sparse, order_cov=ord_cov, columns=columns, bit_packed=bit_packed,
-            n_threads=n_threads, chunk_size=chunk_size, avoid_mw=avoid_mw, b0_deg=b0_deg,
-            bulge_a_deg=bulge_a_deg, bulge_b_deg=bulge_b_deg, pixels=npix, area_deg2=area_deg2)
 
-        print('--- Star mask area                         :', area_deg2)
-        return self.starmask
+        if 'mwmask' in locals() and mwmask is not None:
+            extra_meta = { 'b0_deg': b0_deg, 'bulge_a_deg': bulge_a_deg, 'buge_b_deg': bulge_b_deg, 
+                           'pixels': npix, 'area_deg2': area_deg2 }
+            self._finalize_stage(mwmask, default_name='mwmask', output_stage=mwmask_output_stage, extra_meta=extra_meta);
+
+        extra_meta = { 'starq': starq, 'columns': columns, 'bit_packed': bit_packed, 'n_threads': n_threads, 
+                       'chunk_size': chunk_size, 'avoid_mw': avoid_mw, 'b0_deg': b0_deg, 'bulge_a_deg': bulge_a_deg, 
+                       'bulge_b_deg': bulge_b_deg, 'pixels': npix, 'area_deg2': area_deg2 }
+        return self._finalize_stage(mask, default_name='starmask', output_stage=output_stage, extra_meta=extra_meta)
 
 
+        
 
     @staticmethod
     def reproject_nside_coverage(hspmap, newcov):
@@ -1567,8 +1572,8 @@ class SkyMaskPipe:
         return new_map
 
 
-    def build_prop_mask(self, prop_maps, thresholds, comparisons,
-                        order_prop=None, order_cov=None, bit_packed=None):
+    def build_prop_mask(self, prop_maps, thresholds, comparisons, order_sparse: int = 15, order_cov=None, 
+                        bit_packed=False, output_stage: Optional[str] = None):
         """
         Build a HealSparse boolean mask based on pixels meeting multiple property map thresholds
 
@@ -1582,7 +1587,9 @@ class SkyMaskPipe:
             Comparison operator(s) for each threshold
         bit_packed : bool, optional
             If True, return the ouput as bit-packed boolean map
-
+        output_stage : str, optional
+            Name for the ouput stage. If None, defaults to then canonical name 'propmask'
+            
         Returns
         -------
         mask_map : HealSparseMap
@@ -1591,8 +1598,7 @@ class SkyMaskPipe:
         """
 
         print('BUILDING PROPERTY MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
-        # Check if user wants specific orders, otherwise get from defaults
-        order_sparse = order_prop if order_prop is not None else self.order_prop
+        # Check if user wants specific cov corder, otherwise get from pipeline default
         ord_cov = order_cov if order_cov is not None else self.order_cov
 
         nside_sparse = 1<<order_sparse
@@ -1656,43 +1662,39 @@ class SkyMaskPipe:
 
             if len(pixels) == 0:
                 raise ValueError(f"0 pixels remaining after condition {i} ({comparison} {threshold})")
-
+        
         # Build combined mask using geometry from the first map, i.e. prop_maps[0].nside_coverage
-        self.propmask = hsp.HealSparseMap.make_empty(prop_maps[0].nside_coverage, prop_maps[0].nside_sparse, dtype=np.bool_)
-        self.propmask[pixels] = True
-        #self.order_prop = prop_maps[0].nside_sparse
-
+        mask = hsp.HealSparseMap.make_empty(prop_maps[0].nside_coverage, prop_maps[0].nside_sparse, dtype=np.bool_)
+        mask[pixels] = True
+        
         # Change to desired coverage order. This honors the input keyword parameter, which itself defaults
         # to the pipeline value (order_cov) when not specified
         if nside_cov != prop_maps[0].nside_coverage:
             print(f'--- Propertymap coverage order changed to {ord_cov}')
-            self.propmask = self.change_cov_order(self.propmask, ord_cov, inplace=True, verbose=False)
-            #self.propmask = self.reproject_nside_coverage(self.propmask, self.nside_cov)
+            mask = self.change_cov_order(mask, ord_cov, inplace=True, verbose=False)
+            #mask = self.reproject_nside_coverage(mask, self.nside_cov)
 
         # Change to desired sparse order.This honors the input keyword parameter, which itself defaults
         # to the pipeline value (order_prop) when not specified
         if nside_sparse != prop_maps[0].nside_sparse:
             print(f'--- Propertymap sparse order changed to {order_sparse}')
-            self.propmask = self.change_sparse_order(self.propmask, order_sparse, inplace=True, verbose=False)
-
+            mask = self.change_sparse_order(mask, order_sparse, inplace=True, verbose=False)
+        
         # Force packing if desired
-        if bit_packed: self.propmask = self.propmask.as_bit_packed_map()
+        if bit_packed: mask = mask.as_bit_packed_map()
 
         # Store calling/useful info in its own dictionary
-        area_deg2 = self.propmask.get_valid_area(degrees=True)
-        npix = self.propmask.n_valid
-        self._store_params('propmask',
-            prop_maps=pmstring, thresholds=thresholds, comparisons=comparisons, order_prop=order_sparse,
-            order_cov=ord_cov, bit_packed=bit_packed, pixels=npix, area_deg2=area_deg2)
-
+        area_deg2 = mask.get_valid_area(degrees=True)
+        npix = mask.n_valid
         print('--- Propertymap mask area                       :', area_deg2)
-        return self.propmask
+        extra_meta = { 'prop_maps': pmstring, 'thresholds': thresholds, 'comparisons': comparisons, 
+                       'bit_packed': bit_packed, 'pixels': npix, 'area_deg2': area_deg2 }
+        return self._finalize_stage(mask, default_name='propmask', output_stage=output_stage, extra_meta=extra_meta)
 
 
 
-    def build_patch_mask(self, patchfile=None, qafile=None, order_patch=None, order_cov=None,
-                         filt="(gmag_psf_depth>26.2) and (rmag_psf_depth>25.9) and (imag_psf_depth>25.7)",
-                         bit_packed=None):
+    def build_patch_mask(self, patchfile=None, qafile=None, order_sparse=13, order_cov=None,
+                         filt=None, bit_packed=False, output_stage: Optional[str] = None):
         """
         For a series of HSC patches, matches them against the QA table containing
         quality measurements, filter those that meet some depth/seeing/etc critera,
@@ -1704,13 +1706,15 @@ class SkyMaskPipe:
             HSC patch files (e.g. for hectomap, sping, autumn, aegis)
         qafile : str
             File with the table of patches with QA measurements
-        order_patch : int
-            Pixelization order
+        order_sparse : int
+            Pixelization order of patches
         filt : string
             Contition(s) to apply to patches. If None, all patches will be considered
         bit_packed : bool, optional
             If True, return the ouput as bit-packed boolean map
-
+        output_stage : str, optional
+            Name for the ouput stage. If None, defaults to then canonical name 'patchmask'
+            
         Returns
         -------
         hsp_map
@@ -1725,37 +1729,33 @@ class SkyMaskPipe:
 
         print('BUILDING PATCH MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
         # Check if user wants specific orders, otherwise get from defaults
-        order_sparse = order_patch if order_patch is not None else self.order_patch
         ord_cov = order_cov if order_cov is not None else self.order_cov
 
         nside_sparse = 1<<order_sparse
         nside_cov = 1<<ord_cov
 
-
+        
         # Read patch qa list
         qatable = self.readQApatches(qafile)
 
         # Create the empty boolean map *up front*
-        self.patchmask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_)
+        mask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_)
 
         for p in patchfile:
             fpx = self.filter_and_pixelate_patches(p, qatable, order=order_sparse, filt=filt)
-            self.patchmask[fpx] = True
+            mask[fpx] = True
 
         # Force packing if desired
-        if bit_packed: self.patchmask = self.patchmask.as_bit_packed_map()
+        if bit_packed: mask = mask.as_bit_packed_map()
 
         # Store calling/useful info in its own dictionary
-        area_deg2 = self.patchmask.get_valid_area(degrees=True)
-        npix = self.patchmask.n_valid
-        self._store_params('patchmask',
-            patchfile=patchfile, qafile=qafile, order_zone=order_sparse, order_cov=ord_cov,
-            filt=filt, bit_packed=bit_packed, pixels=npix, area_deg2=area_deg2)
-
+        area_deg2 = mask.get_valid_area(degrees=True)
+        npix = mask.n_valid
         print('--- Patch mask area                           :', area_deg2)
-        return self.patchmask
-
-
+        extra_meta = { 'patchfile': patchfile, 'qafile': qafile, 'filt': filt, 'bit_packed': bit_packed, 
+                       'pixels': npix, 'area_deg2': area_deg2 }
+        return self._finalize_stage(mask, default_name='patchmask', output_stage=output_stage, extra_meta=extra_meta)
+    
 
 
     @staticmethod
@@ -1827,9 +1827,10 @@ class SkyMaskPipe:
         raise ValueError("sources must be a HATS/lsdb Catalog, str, astropy.table.Table, or pandas.DataFrame")
 
 
-    def build_foot_mask(self, sources, order_foot: Optional[int] = None, order_cov: Optional[int] = None,
-                        columns: Iterable[str] = ("ra", "dec"), *, remove_isopixels: bool = False,
-                        erode_borders: bool = False, mapping: bool = False, bit_packed: bool = True):
+    def build_foot_mask(self, sources, *, order_sparse: int = 13, order_cov: Optional[int] = None,
+                        columns: Iterable[str] = ("ra", "dec"), remove_isopixels: bool = False,
+                        erode_borders: bool = False, mapping: bool = False, bit_packed: bool = False, 
+                        output_stage: Optional[str] = None):
         """
         Create a footprint mask of a source catalog (from any astropy-supported table or HATS catalog),
         pixelated at a given order. Optionally remove isolated empty pixels and erode borders
@@ -1839,8 +1840,8 @@ class SkyMaskPipe:
         ----------
         sources : str | astropy.table.Table | pandas.DataFrame | HATS/lsdb Catalog
             Input catalog or path (any format supported by astropy, or a HATS catalog).
-        order_foot : int, optional
-            Pixelization order. If None, uses self.order_foot.
+        order_sparse : int, optional
+            Pixelization order of sources
         columns : (str, str)
             Names of the RA and Dec columns (degrees).
         remove_isopixels : bool
@@ -1851,7 +1852,9 @@ class SkyMaskPipe:
             If True, distribute pixelization across HATS partitions (requires a running Dask cluster).
         bit_packed : bool
             If True, return the ouput as bit-packed boolean map
-
+        output_stage : str, optional
+            Name for the ouput stage. If None, defaults to then canonical name 'footmask'
+            
         Returns
         -------
         healsparse.HealSparseMap
@@ -1860,7 +1863,6 @@ class SkyMaskPipe:
         """
         columns = tuple(columns)
         # Check if user wants specific orders, otherwise get from defaults
-        order_sparse = order_foot if order_foot is not None else self.order_foot
         ord_cov = order_cov if order_cov is not None else self.order_cov
 
         nside_sparse = 1 << order_sparse
@@ -1870,136 +1872,41 @@ class SkyMaskPipe:
         print("    Order ::", order_sparse)
 
         # Prepare empty output footprint map
-        self.footmask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_)
+        mask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_)
 
         # Compute pixels exactly once (except for HATS+mapping which is distributed)
         pixels = self._pixels_from_sources(sources, nside_sparse, columns, mapping=mapping,
                                            order_foot=order_sparse, order_cov=ord_cov)
 
         # Update map values for pixels that have objects
-        if pixels.size: self.footmask.update_values_pix(pixels, True, operation="or")
+        if pixels.size: mask.update_values_pix(pixels, True, operation="or")
 
         # Optional post-processing
-        if remove_isopixels: self.footmask = self.remove_isopixels(self.footmask)
-        if erode_borders: self.footmask = self.erode_borders(self.footmask)
+        if remove_isopixels: mask = self.remove_isopixels(mask)
+        if erode_borders: mask = self.erode_borders(mask)
 
         # Force packing if desired
-        if bit_packed: self.footmask = self.footmask.as_bit_packed_map()
+        if bit_packed: mask = mask.as_bit_packed_map()
 
         # Store calling/useful info in its own dictionary
-        area_deg2 = self.footmask.get_valid_area(degrees=True)
-        npix = self.footmask.n_valid
+        area_deg2 = mask.get_valid_area(degrees=True)
+        npix = mask.n_valid
         if hasattr(sources, "hc_structure") and hasattr(sources.hc_structure, "catalog_path"):
             sources_string = sources.hc_structure.catalog_path  # extract lsdb path
         elif isinstance(sources, (str, Path)):
             sources_string = str(sources)                        # get simply the string
         else:
             sources_string = "<mem>"                             # fallback when input from mem
-        self._store_params('footmask',
-            sources=sources_string, order_foot=order_sparse, order_cov=ord_cov,
-            columns=columns, remove_isopixels=remove_isopixels, erode_borders=erode_borders,
-            bit_packed=bit_packed, pixels=npix, area_deg2=area_deg2)
-
         print('--- Foot mask area                         :', area_deg2)
-        return self.footmask
-
-
-    def BAK_build_footprint_mask(self, sources, order_foot=None, columns=['ra','dec'],
-                                remove_isopixels=False, erode_borders=False, mapping=False):
-        """
-        Create a footprint map of a source catalog (from any astropy-supported table or HATS),
-        pixelated at a given order. Optionally remove isolated empty pixels and erode borders
-        around empty zones. For details see remove_isopixels() and erode_borders()
-
-        Parameters
-        ----------
-        sources : str, astropy.table.Table, pandas.DataFrame, or HATS catalog
-            Input catalog or path to catalog (any format supported by astropy or lsdb.read_hats for HATS)
-        order_foot : int
-            Pixelization order
-        columns : list of str
-            Columns for ra, dec
-        remove_isopixels : bool
-            Remove isolated (empty) pixels surrounded by 8 non-empty pixels
-        erode_borders : bool
-            Detect and remove border pixels around holes
-        mapping : bool
-            If True, distribute pixelization across HATS partitions. A Dask cluster must be running
-
-        Returns
-        -------
-        hsp_map
-            Healsparse boolean map
-        """
-
-        def footpartition(df, pixel, order_foot=15, order_cov=6, columns=['ra','dec']):
-            # Returns a df with the list of pixels of the input df
-            nside_foot   = 1<<order_foot
-            nside_cov    = 1<<order_cov
-            foot = hsp.HealSparseMap.make_empty(nside_cov, nside_foot, dtype=np.bool_)
-            pixels = hp.ang2pix(nside_foot, df[columns[0]], df[columns[1]], nest=True, lonlat=True)
-            foot.update_values_pix(pixels, True, operation='or')   #np.full_like(pixels, True, dtype=np.bool_)
-            outdf = pd.DataFrame(foot.valid_pixels, columns=['pxs'])
-            return outdf
-
-        metafootpartition = pd.DataFrame([{"pxs": 0}])
-
-
-        if order_foot: self.order_foot = order_foot
-        colra, coldec = columns
-        print('BUILDING FOOTPRINT MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
-
-        # Create empty healsparse foot
-        nside_foot = 1<<self.order_foot
-        self.foot = hsp.HealSparseMap.make_empty(self.nside_cov, nside_foot, dtype=np.bool_)
-
-        # Read sources and pixelize based on input type
-        srcs = None
-        if str(sources.__class__) == "<class 'lsdb.catalog.catalog.Catalog'>" :
-            print('--- Pixelating HATS catalog')
-            import lsdb
-            srcs = sources
-            if mapping:
-                print(f"    Partitions for mapping: {srcs.npartitions:<7}")
-                pixdf = srcs.map_partitions(footpartition, include_pixel=True, meta=metafootpartition,
-                                            order_foot=self.order_foot, order_cov=self.order_cov, columns=columns).compute()
-                pixels = np.array(pixdf['pxs'].values)
-            else:
-                srcs = srcs[columns].compute()
-                pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True) # get pixel nr for each object
-        elif isinstance(sources, Table):
-            print('--- Pixelating sources')
-            srcs = sources
-            pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True) # get pixel nr for each object
-        elif isinstance(sources, pd.DataFrame):
-            print('--- Pixelating sources')
-            srcs = Table.from_pandas(sources)
-            pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True) # get pixel nr for each object
-        elif isinstance(sources, str):
-            print('--- Pixelating sources from:', sources)
-            srcs = Table.read(sources)
-            pixels = hp.ang2pix(nside_foot, srcs[colra], srcs[coldec], nest=True, lonlat=True) # get pixel nr for each object
-        else:
-            raise ValueError("sources must be a str, astropy.table.Table, or pandas.DataFrame")
-
-        print('    Order ::',self.order_foot)
-
-        # Update map values for pixels that have objects
-        self.foot.update_values_pix(pixels, True, operation='or')
-
-        # Remove isolated empty pixels and borders around holes, if requested
-        if remove_isopixels:
-            self.foot = self.remove_isopixels(self.foot)
-
-        if erode_borders:
-            self.foot = self.erode_borders(self.foot)
-
-        print('--- Footprint map area                    :', self.foot.get_valid_area(degrees=True))
+        extra_meta = { 'sources': sources_string, 'columns': columns, 'remove_isopixels': remove_isopixels, 
+                       'erode_borders': erode_borders, 'bit_packed': bit_packed, 'pixels': npix, 'area_deg2': area_deg2 }
+        return self._finalize_stage(mask, default_name='footmask', output_stage=output_stage, extra_meta=extra_meta)
 
 
 
     @staticmethod
-    def intersect_boolmask(mask1, mask2, bit_packed: "Optional[bool]" = None):
+    def intersect_boolmask(mask1 : HealSparseMap, mask2 : HealSparseMap, 
+                           bit_packed: Optional[bool] = None) -> HealSparseMap:
         """
         Intersect two arbitrary boolean masks in healsparse format.
 
@@ -2035,7 +1942,8 @@ class SkyMaskPipe:
 
 
     @staticmethod
-    def subtract_boolmask(mask1, mask2, bit_packed: "Optional[bool]" = None):
+    def subtract_boolmask(mask1 : HealSparseMap, mask2 : HealSparseMap, 
+                          bit_packed: Optional[bool] = None) -> HealSparseMap:
         """
         Subtract two arbitrary boolean masks in healsparse format.
 
@@ -2115,7 +2023,10 @@ class SkyMaskPipe:
         mk = getattr(self, stage)
 
         # Use randoms for scatter plot
-        xx, yy = hsp.make_uniform_randoms_fast(mk, nr)
+        radec = self.makerans(stage=mk, nr=nr, file=None, nside_randoms=None, rng=None)
+        xx=radec['ra']
+        yy=radec['dec']
+        #xx, yy = hsp.make_uniform_randoms_fast(mk, nr)
 
         # Do plot ------------------------------------------
         if not(ax): fig, ax = plt.subplots(figsize=figsize)
@@ -2237,39 +2148,8 @@ class SkyMaskPipe:
 
 
 
-    def makerans(self, stage='mask', nr=50_000, file=None, **kwargs):
-        """
-        Generate random points over a given mask and optionally save it to disk
-
-        Parameters
-        ----------
-        stage : str
-            Masking stage to use, e.g. 'mask', 'foot', 'holemap', etc.
-        nr : int
-            Number of randoms
-        file : str, optional
-            Output file (any format supported by astropy)
-        kwargs : kwargs
-            Extra arguments passed to astropy's write(), e.g. format="parquet"
-
-        Returns
-        -------
-        dataframe/astropy_table
-            Input catalog with mask applied
-        """
-        # Choose stage based on its name in a pipeline
-        mk = getattr(self, stage)
-
-        rra, rdec = hsp.make_uniform_randoms_fast(mk, nr)
-        tt = Table([rra, rdec],names=['ra','dec'])
-        if file:
-            tt.write(file, overwrite=True, **kwargs)
-            print(str(nr),'randoms written to:', file)
-
-        return tt
-
-
-    def apply(self, stage='mask', cat=None, columns=['ra','dec'], file=None):
+    def apply(self, stage : str ='mask', cat: Union[pd.DataFrame, Table, None] = None, 
+              columns: Sequence[str] = ("ra", "dec"), file: Optional[str] = None) -> Union[pd.DataFrame, Table]:
         """
         Apply a mask to a catalog (DataFrame/Astropy_Table) and optionally save it to disk.
 
@@ -2467,7 +2347,7 @@ class SkyMaskPipe:
 
 
     @staticmethod
-    def pix_in_zone(hsp, ra_min: float, ra_max: float, dec_min: float, dec_max: float, *,
+    def pix_in_zone(hsp : HealSparseMap, ra_min: float, ra_max: float, dec_min: float, dec_max: float, *,
                     dec_seg_deg: float = 1.0, pix_chunk: int = 5_000_000,
                     return_mode: str = "generator", dtype=None):
         """
@@ -2483,9 +2363,9 @@ class SkyMaskPipe:
 
         Parameters
         ----------
-        stage : hspmap
+        hsp : healsparsemap
             Healsparse map of a stage
-        ra_min, ra_max, dec_min, dec_flat :  floats
+        ra_min, ra_max, dec_min, dec_max :  floats
             Ra-dec boundaries of the zone (in deg)
         dec_seg_deg : float
             Width of declination stripes to query the valid pixels on
@@ -2613,10 +2493,14 @@ class SkyMaskPipe:
         return depth_res
 
 
-    def plot_moc(self, stage, center=None, fov=None, clipra=None, clipdec=None, order_force=None,
-                 frame='icrs', projection='SIN', figsize=(10, 5),
-                 color='green', alpha=0.2, linewidth=1.0, label=None,
-                 ax=None, wcs=None, show=False, stream_pars=None):
+
+    def plot_moc(self, stage: Union[HealSparseMap, str], center: Optional[SkyCoord] = None, 
+                 fov: Optional[Angle] = None, clipra: Optional[tuple[float, float]] = None, 
+                 clipdec: Optional[tuple[float, float]] = None, order_force: Optional[int] = None,
+                 frame: str = "icrs", projection: str = "SIN", figsize: tuple[float, float] = (10.0, 5.0),
+                 color: str = "green", alpha: float = 0.2, linewidth: float = 1.0, label: Optional[str] = None,
+                 ax: Optional[Axes] = None, wcs: Optional[WCS] = None, show: bool = False, 
+                 stream_pars: Optional[dict[str, object]] = None) -> tuple[Figure, Axes, WCS]:
         """
         Plot a MOC version of a given stage or healsparse map. Optionally clip pixels outside
         a given ra-dec box to speed up zoomed views of masks with high orders.
@@ -2691,7 +2575,7 @@ class SkyMaskPipe:
                 lon = ax.coords['ra']; lat = ax.coords['dec']
                 lon.set_format_unit(u.deg, decimal=True, show_decimal_unit=True)
                 lat.set_format_unit(u.deg, decimal=True, show_decimal_unit=True)
-                ax.set_xlabel("dec"); ax.set_ylabel("ra")
+                ax.set_xlabel("ra"); ax.set_ylabel("dec")
                 ax.grid(color="black", linestyle="dotted")
                 wcs = _wcs
                 created_context = True
@@ -2725,38 +2609,41 @@ class SkyMaskPipe:
         return fig, ax, wcs
 
 
-    @staticmethod
-    def moc_from_stage(stage, order_forced: int|None = None):
-        """
-        Get the MOC from a stage or healsparse map
-        """
-        # Choose stage based on input healsparse map or the name of stage in a pipeline
-        if hasattr(stage, 'valid_pixels'):
-            stage = stage
-        else:
-            stage = getattr(self, stage)
-
-        # Read pixels without care
-        print(f'Retrieveing {stage.n_valid} pixels...')
-        pixels = stage.valid_pixels
-
-        # Build MOC at chosen order
-        order_sparse = int(np.log2(stage.nside_sparse))
-        order  = order_forced if order_forced else order_sparse
-        print(f'Building MOC at order {order}...')
-        moc = MOC.from_healpix_cells(ipix=pixels, depth=order_sparse, max_depth=order)
-
-        return moc
-
 
     @staticmethod
-    def add_moca(alwidget, stage, color: str = "red", opacity: float = 0.25,
-                 order_forced: int|None = None):
+    def add_moca(alwidget, stage: Union[HealSparseMap, str], color: str = "red", opacity: float = 0.25,
+                 rows_per_batch: int = 2048, order_forced: Optional[int] = None) -> None:
         """
-        For a stage or healsparse mpa, build its MOC and add it to an existing aladin widget
+        Build a MOC from a SkyMaskPipe stage or a boolean HealSparseMap and add it
+        as an overlay to an existing ipyaladin Aladin widget.
+
+        This helper is intended to be called from :meth:`plot_moca` or directly when you
+        already have an ``ipyaladin.Aladin`` instance open in a Jupyter notebook.
+
+        Parameters
+        ----------
+        alwidget
+            An active :class:`ipyaladin.Aladin` widget in which the MOC overlay will be drawn.
+        stage : str or HealSparseMap
+            Either the name of a SkyMaskPipe stage or a healsparse boolean map.
+        color : str, optional
+            CSS color name or hex code for both the MOC fill and border. Default is ``"red"``.
+        opacity : float, optional
+            Opacity of the MOC fill, between 0 (fully transparent) and 1 (opaque). Default is ``0.25``.
+        rows_per_batch : int, optional
+            Number of coverage rows to process per batch when building the MOC. Higher values can reduce overhead but use more memory. Default is ``2048``.
+        order_forced : int, optional
+            If provided, forces the generated MOC to be degraded this HEALPix order before adding it to the widget. Default is ``None``, 
+            which keeps the native sparse order.
+
+        Returns
+        -------
+        None
+            Updates ``alwidget`` in place but does not return a value.
         """
         # Build the MOC at the chosen order
-        moc = SkyMaskPipe.moc_from_stage(stage, order_forced=order_forced)
+        #moc = SkyMaskPipe.moc_from_stage(stage, order_forced=order_forced)
+        moc = SkyMaskPipe.moc_from_stage(stage, order_forced=order_forced, rows_per_batch=rows_per_batch)
 
         # Add the MOC, with good error reporting if it fails
         try:
@@ -2783,9 +2670,9 @@ class SkyMaskPipe:
             ) from e
 
 
-    def plot_moca(self, stage, color: str = "red", opacity: float = 0.25, colormap: str = "viridis",
-                  target: str = "268 -26", fov: float = 120.0, survey: str = "CDS/P/DM/I/355/gaiadr3",
-                  order_forced: int|None = None):
+    def plot_moca(self, stage: Union[HealSparseMap, str], color: str = "red", opacity: float = 0.25, 
+                  colormap: str = "viridis", target: str = "268 -26", fov: float = 120.0, 
+                  survey: str = "CDS/P/DM/I/355/gaiadr3", order_forced: Optional[int] = None):
         """
         Create an ipyaladin widget, load a HiPS survey, overlay a MOC, and set display
         customizations such as colormap and coordinate frame.
@@ -2883,7 +2770,7 @@ class SkyMaskPipe:
         Returns
         -------
         (name, map)
-            - name: canonical stage attribute name on `self` ("foot", "propmap", ...),
+            - name: canonical stage attribute name on `self` ("footmask", "propmask", ...),
                     or a descriptive label like "<map>" if the input is a raw map
                     not attached to the pipeline.
             - map : the HealSparseMap object.
@@ -2892,13 +2779,14 @@ class SkyMaskPipe:
             # add aliases if needed → canonical attribute names on `self`
             'footprint': 'foot',
             'patchmask': 'patchmask',
-            'propmap': 'propmap',
+            'propmask': 'propmask',
             'circmask': 'circmask',
             'ellipmask': 'ellipmask',
             'starmask': 'starmask',
             'boxmask': 'boxmask',
             'zonemask': 'zonemask',
             'polymask': 'polymask',
+            'mwmask': 'mwmask',
         }
 
         # Case 1: user passed a stage name (string)
@@ -2923,8 +2811,9 @@ class SkyMaskPipe:
             dtype=np.bool_, bit_packed=bool(bit_packed) )
 
 
-    def combine(self, *, positive, negative=None, order_out: Optional[int] = None,
-                order_cov: Optional[int] = None, bit_packed: bool = True, verbose: bool = True):
+    def combine(self, positive, *, negative=None, order_out: Optional[int] = None,
+                order_cov: Optional[int] = None, bit_packed: bool = True, verbose: bool = True, 
+                output_stage: Optional[str] = None):
         """
         Combine multiple stage masks into a single mask using logical operations.
 
@@ -2954,7 +2843,9 @@ class SkyMaskPipe:
         verbose : bool, default=True
             If True, prints progress messages about coverage alignment,
             stage orders, and final statistics.
-
+        output_stage : str, optional
+            Name for the ouput stage. If None, defaults to then canonical name 'mask'
+            
         Returns
         -------
         mask : healsparse.HealSparseMap
@@ -3278,7 +3169,6 @@ class SkyMaskPipe:
 
         # 4) Finalize  ==================================================================================
         res = out
-        self.mask = res
         self.order_out = tgt_ord
         self.order_cov = cov_ord
         self.nside_out = tgt_ns
@@ -3290,10 +3180,13 @@ class SkyMaskPipe:
                   f"order_cov={cov_ord} (NSIDE={cov_ns}), "
                   f"valid_pix={res.n_valid:,}, area={area:.3f} deg², bit_packed={bit_packed}")
 
-        return res
+        extra_meta = {}
+        return self._finalize_stage(res, default_name='mask', output_stage=output_stage, extra_meta=extra_meta)
 
 
-    def change_sparse_order(self, stage, order: int, *, inplace: bool = True, verbose: bool = True):
+    
+    def change_sparse_order(self, stage: Union[str, HealSparseMap], order: int, *, inplace: bool = True, 
+                            verbose: bool = True) -> HealSparseMap:
         """
         Change the sparse resolution for a boolean (or bit-packed boolean) stage or HealSparseMap,
         while preserving coverage and bit-packing.
@@ -3366,7 +3259,8 @@ class SkyMaskPipe:
         return out
 
 
-    def change_cov_order(self, stage, order: int, *, inplace: bool = True, verbose: bool = True):
+    def change_cov_order(self, stage: Union[str, HealSparseMap], order: int, *, inplace: bool = True, 
+                         verbose: bool = True):
         """
         Change coverage order (nside_coverage) while preserving sparse resolution and bitpacking
 
@@ -3430,18 +3324,18 @@ class SkyMaskPipe:
 
         return out
 
+    
 
-    def build_circ_mask(self, data: Union[pd.DataFrame, str, Path] = None, order_circ: Optional[int] = None,
-            order_cov: Optional[int] = None, fmt: str = 'ascii',
-            columns: Optional[Sequence[str]] = ['ra','dec','radius'],
-            bit_packed: Optional[bool] = None, n_threads: int = 4):
+    def build_circ_mask(self, data: Union[pd.DataFrame, str, Path] = None, order_sparse: int = 15,
+            order_cov: Optional[int] = None, fmt: str = 'ascii', columns: Optional[Sequence[str]] = ['ra','dec','radius'],
+            bit_packed: bool = False, n_threads: int = 4, chunk_size: int = 600_000, output_stage: Optional[str] = None):
 
         """
         Build a mask from input circle data and store it as a HealSparse boolean map.
 
         Each input row describes a circle in the sky, defined as [ra_center, dec_center, radius]
         in degrees, whera ra_center,dec_center are the center coordinates. The circles are
-        pixelized at `order_circ` to produce the set of HEALPix pixels covering it.
+        pixelized at `order_sparse` to produce the set of HEALPix pixels covering it.
 
         Parameters
         ----------
@@ -3449,8 +3343,8 @@ class SkyMaskPipe:
             The circle definitions. If a DataFrame, it must contain the columns named
             in `columns`. If a path (string or Path), it is read according
             to `fmt` (delegated to astropy).
-        order_circ : int, optional
-            Sparse order to pixelize the circles. If None, falls back to `self.order_circ`
+        order_sparse : int, optional
+            Sparse order to pixelize the circles
         order_cov : int, optional
             Coverage order. If None, falls back to `self.order_cov`
         fmt : str, default "ascii"
@@ -3463,7 +3357,11 @@ class SkyMaskPipe:
             If True, return the ouput as bit-packed boolean map
         n_threads : int, default=4
             Number of threads to use in the pixelization step
-
+        chunk_size : int, default=600000
+            Number circles pixelized at once. Watch out memory if chunk_size and n_threads are both large
+        output_stage : str, optional
+            Name for the ouput stage. If None, defaults to then canonical name 'circmask'
+            
         Returns
         -------
         HealSparseMap
@@ -3472,47 +3370,45 @@ class SkyMaskPipe:
         """
         print('BUILDING CIRCLES MASK >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
         # Check if user wants specific orders, otherwise get from defaults
-        order_sparse = order_circ if order_circ is not None else self.order_circ
         ord_cov = order_cov if order_cov is not None else self.order_cov
 
         nside_sparse = 1<<order_sparse
         nside_cov = 1<<ord_cov
 
         # Create the empty boolean map up front
-        self.circmask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_)
+        mask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_)
 
         # Perform pixelization
-        self.pixelate_circles(data, self.circmask, fmt=fmt, order=order_sparse, columns=columns, n_threads=n_threads)
+        self.pixelate_circles(data, mask, fmt=fmt, order=order_sparse, columns=columns,
+                              n_threads=n_threads, chunk_size=chunk_size)
         #if pix is not None and len(pix) > 0:
         #    self.circmask.update_values_pix(pix, True)
 
         # Force packing if desired
-        if bit_packed: self.circmask = self.circmask.as_bit_packed_map()
+        if bit_packed: mask = mask.as_bit_packed_map()
 
         # Store calling/useful info in its own dictionary
-        area_deg2 = self.circmask.get_valid_area(degrees=True)
-        npix = self.circmask.n_valid
-        self._store_params('circmask',
-            data=(str(data) if isinstance(data, (str, Path)) else "<mem>"),
-            order_circ=order_sparse, order_cov=ord_cov,
-            fmt=fmt, columns=columns, bit_packed=bit_packed, n_threads=n_threads,
-            pixels=npix, area_deg2=area_deg2)
-
+        area_deg2 = mask.get_valid_area(degrees=True)
+        npix = mask.n_valid
         print('--- Circles mask area                        :', area_deg2)
-        return self.circmask
+        extra_meta = { 'data': (str(data) if isinstance(data, (str, Path)) else "<mem>"), 'fmt': fmt, 
+                       'columns': columns, 'bit_packed': bit_packed, 'n_threads':n_threads, 
+                       'pixels': npix, 'area_deg2': area_deg2 }
+        return self._finalize_stage(mask, default_name='circmask', output_stage=output_stage, extra_meta=extra_meta)
 
 
-    def build_box_mask(self, data: Union[pd.DataFrame, str, Path] = None, order_box: Optional[int] = None,
+    
+    def build_box_mask(self, data: Union[pd.DataFrame, str, Path] = None, order_sparse: int = 15,
             order_cov: Optional[int] = None, fmt: str = 'ascii',
             columns: Optional[Sequence[str]] = ['ra_c','dec_c','width','height'],
-            bit_packed: Optional[bool] = None, n_threads: int = 4):
+            bit_packed: bool = False, n_threads: int = 4, output_stage: Optional[str] = None):
 
         """
         Build a mask from input box data and store it as a HealSparse boolean map.
 
         Each input row describes a box in the sky, defined as [ra_center, dec_center,
         width, height] in degrees, whera ra_center,dec_center are the center coordinates.
-        The boxes are pixelized at `order_box` to produce the set of HEALPix pixels covering it.
+        The boxes are pixelized at `order_sparse` to produce the set of HEALPix pixels covering it.
 
         Parameters
         ----------
@@ -3520,8 +3416,8 @@ class SkyMaskPipe:
             The box definitions. If a DataFrame, it must contain the columns named
             in `columns`. If a path (string or Path), it is read according
             to `fmt` (delegated to astropy).
-        order_poly : int, optional
-            Sparse order to pixelize the boxes. If None, falls back to `self.order_box`
+        order_sparse : int, optional
+            Sparse order to pixelize the boxes
         order_cov : int, optional
             Coverage order. If None, falls back to `self.order_cov`
         fmt : str, default "ascii"
@@ -3534,6 +3430,8 @@ class SkyMaskPipe:
             If True, return the ouput as bit-packed boolean map
         n_threads : int, default=4
             Number of threads to use in the pixelization step
+        output_stage : str, optional
+            Name for the ouput stage. If None, defaults to then canonical name 'boxmask'
 
         Returns
         -------
@@ -3544,47 +3442,44 @@ class SkyMaskPipe:
         """
         print('BUILDING BOXES MASK >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
         # Check if user wants specific orders, otherwise get from defaults
-        order_sparse = order_box if order_box is not None else self.order_box
         ord_cov = order_cov if order_cov is not None else self.order_cov
 
         nside_sparse = 1<<order_sparse
         nside_cov = 1<<ord_cov
 
         # Create the empty boolean map *up front*
-        self.boxmask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_)
+        mask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_)
 
         # Perform pixelization
         pix = self.pixelate_boxes(data, fmt=fmt, order=order_sparse, columns=columns, n_threads=n_threads)
         if pix is not None and len(pix) > 0:
-            self.boxmask.update_values_pix(pix, True)
+            mask.update_values_pix(pix, True)
 
         # Force packing if desired
-        if bit_packed: self.boxmask = self.boxmask.as_bit_packed_map()
+        if bit_packed: mask = mask.as_bit_packed_map()
 
         # Store calling/useful info in its own dictionary
-        area_deg2 = self.boxmask.get_valid_area(degrees=True)
-        npix = self.boxmask.n_valid
-        self._store_params('boxmask',
-            data=(str(data) if isinstance(data, (str, Path)) else "<mem>"),
-            order_box=order_sparse, order_cov=ord_cov,
-            fmt=fmt, columns=columns, bit_packed=bit_packed, n_threads=n_threads,
-            pixels=npix, area_deg2=area_deg2)
-
+        area_deg2 = mask.get_valid_area(degrees=True)
+        npix = mask.n_valid
         print('--- Boxes mask area                           :', area_deg2)
-        return self.boxmask
+        extra_meta = { 'data': (str(data) if isinstance(data, (str, Path)) else "<mem>"), 'fmt': fmt, 
+                       'columns': columns, 'bit_packed': bit_packed, 'n_threads':n_threads, 
+                       'pixels': npix, 'area_deg2': area_deg2 }
+        return self._finalize_stage(mask, default_name='boxmask', output_stage=output_stage, extra_meta=extra_meta)
 
+        
 
-    def build_ellip_mask(self, data: Union[pd.DataFrame, str, Path] = None, order_ellip: Optional[int] = None,
+    def build_ellip_mask(self, data: Union[pd.DataFrame, str, Path] = None, order_sparse: int = 15,
             order_cov: Optional[int] = None, fmt: str = 'ascii',
             columns: Optional[Sequence[str]] = ['ra','dec','a','b','pa'],
-            bit_packed: Optional[bool] = None):
+            bit_packed: bool = False, output_stage: Optional[str] = None):
 
         """
         Build a mask from input ellipse data and store it as a HealSparse boolean map.
 
         Each input row describes an ellipse in the sky, defined as [ra, dec, a, b, pa]
         in degrees, where ra,dec are center coordinates; a,b are the mayor and minor half axes;
-        and pa is the position angle. The rectangles are pixelized at `order_ellip` to
+        and pa is the position angle. The ellipses are pixelized at `order_sparse` to
         produce the set of HEALPix pixels covering it.
 
         Parameters
@@ -3593,8 +3488,8 @@ class SkyMaskPipe:
             The ellipse definitions. If a DataFrame, it must contain the columns named
             in `columns`. If a path (string or Path), it is read according
             to `fmt` (delegated to astropy).
-        order_ellip : int, optional
-            Sparse order to pixelize the ellipses. If None, falls back to `self.order_ellip`
+        order_sparse : int, optional
+            Sparse order to pixelize the ellipses
         order_cov : int, optional
             Coverage order. If None, falls back to `self.order_cov`
         fmt : str, default "ascii"
@@ -3605,7 +3500,9 @@ class SkyMaskPipe:
             "a", "b", "pa"]`
         bit_packed : bool, optional
             If True, return the ouput as bit-packed boolean map
-
+        output_stage : str, optional
+            Name for the ouput stage. If None, defaults to then canonical name 'ellipmask'
+            
         Returns
         -------
         HealSparseMap
@@ -3615,47 +3512,44 @@ class SkyMaskPipe:
 
         print('BUILDING ELLIPSES MASK >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
         # Check if user wants specific orders, otherwise get from defaults
-        order_sparse = order_ellip if order_ellip is not None else self.order_ellip
         ord_cov = order_cov if order_cov is not None else self.order_cov
 
         nside_sparse = 1<<order_sparse
         nside_cov = 1<<ord_cov
 
         # Create the empty boolean map *up front*
-        self.ellipmask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_)
+        mask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_)
 
         # Perform pixelization
         pix = self.pixelate_ellipses(data, fmt=fmt, order=order_sparse, columns=columns)
         if pix is not None and len(pix) > 0:
-            self.ellipmask.update_values_pix(pix, True)
+            mask.update_values_pix(pix, True)
 
         # Force packing if desired
-        if bit_packed: self.ellipmask = self.ellipmask.as_bit_packed_map()
+        if bit_packed: mask = mask.as_bit_packed_map()
 
         # Store calling/useful info in its own dictionary
-        area_deg2 = self.ellipmask.get_valid_area(degrees=True)
-        npix = self.ellipmask.n_valid
-        self._store_params('ellipmask',
-            data=(str(data) if isinstance(data, (str, Path)) else "<mem>"),
-            order_ellip=order_sparse, order_cov=ord_cov,
-            fmt=fmt, columns=columns, bit_packed=bit_packed,
-            pixels=npix, area_deg2=area_deg2)
-
+        area_deg2 = mask.get_valid_area(degrees=True)
+        npix = mask.n_valid
         print('--- Ellipses mask area                        :', area_deg2)
-        return self.ellipmask
+        extra_meta = { 'data': (str(data) if isinstance(data, (str, Path)) else "<mem>"), 'fmt': fmt, 
+                       'columns': columns, 'bit_packed': bit_packed, 'pixels': npix, 'area_deg2': area_deg2 }
+        return self._finalize_stage(mask, default_name='ellipmask', output_stage=output_stage, extra_meta=extra_meta)
 
 
-    def build_poly_mask(self, data: Union[pd.DataFrame, str, Path] = None, order_poly: Optional[int] = None,
+    
+
+    def build_poly_mask(self, data: Union[pd.DataFrame, str, Path] = None, order_sparse: int = 15,
             order_cov: Optional[int] = None, fmt: str = 'ascii',
             columns: Optional[Sequence[str]] = ['ra0','ra1','ra2','ra3','dec0','dec1','dec2','dec3'],
-            bit_packed: Optional[bool] = None, n_threads: int = 4):
+            bit_packed: bool = False, n_threads: int = 4, output_stage: Optional[str] = None):
 
         """
         Build a mask from input polygon data and store it as a HealSparse boolean map.
 
         Each input row describes a sky quadrangular polygon via 4 corner points
         (ra0, ra1, ra2, ra3, dec0, dec1, dec2, dec3) in degrees. The rectangles are
-        pixelized at `order_poly` to produce the set of HEALPix pixels covering it.
+        pixelized at `order_sparse` to produce the set of HEALPix pixels covering it.
 
         Parameters
         ----------
@@ -3663,8 +3557,8 @@ class SkyMaskPipe:
             The polygon definitions. If a DataFrame, it must contain the columns named
             in `columns`. If a path (string or Path), it is read according
             to `fmt` (delegated to astropy).
-        order_poly : int, optional
-            Sparse order to pixelize the polygons. If None, falls back to `self.order_poly`
+        order_sparse : int, optional
+            Sparse order to pixelize the polygons
         order_cov : int, optional
             Coverage order. If None, falls back to `self.order_cov`
         fmt : str, default "ascii"
@@ -3677,7 +3571,9 @@ class SkyMaskPipe:
             If True, return the ouput as bit-packed boolean map
         n_threads : int, default=4
             Number of threads to use in the pixelization step
-
+        output_stage : str, optional
+            Name for the ouput stage. If None, defaults to then canonical name 'polymask'
+            
         Returns
         -------
         HealSparseMap
@@ -3687,48 +3583,45 @@ class SkyMaskPipe:
 
         print('BUILDING POLYGON MASK >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
         # Check if user wants specific orders, otherwise get from defaults
-        order_sparse = order_poly if order_poly is not None else self.order_poly
         ord_cov = order_cov if order_cov is not None else self.order_cov
 
         nside_sparse = 1<<order_sparse
         nside_cov = 1<<ord_cov
 
         # Create the empty boolean map *up front*
-        self.polymask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_)
+        mask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_)
 
         # Perform pixelization
         pix = self.pixelate_polys(data, fmt=fmt, order=order_sparse, columns=columns, n_threads=n_threads)
         if pix is not None and len(pix) > 0:
-            self.polymask.update_values_pix(pix, True)
+            mask.update_values_pix(pix, True)
 
         # Force packing if desired
-        if bit_packed: self.polymask = self.polymask.as_bit_packed_map()
+        if bit_packed: mask = mask.as_bit_packed_map()
 
         # Store calling/useful info in its own dictionary
-        area_deg2 = self.polymask.get_valid_area(degrees=True)
-        npix = self.polymask.n_valid
-        self._store_params('polymask',
-            data=(str(data) if isinstance(data, (str, Path)) else "<mem>"),
-            order_poly=order_sparse, order_cov=ord_cov,
-            fmt=fmt, columns=columns, bit_packed=bit_packed, n_threads=n_threads,
-            pixels=npix, area_deg2=area_deg2)
-
+        area_deg2 = mask.get_valid_area(degrees=True)
+        npix = mask.n_valid
         print('--- Polygon mask area                           :', area_deg2)
-        return self.polymask
+        extra_meta = { 'data': (str(data) if isinstance(data, (str, Path)) else "<mem>"), 'fmt': fmt, 
+                       'columns': columns, 'bit_packed': bit_packed, 'n_threads':n_threads, 
+                       'pixels': npix, 'area_deg2': area_deg2 }
+        return self._finalize_stage(mask, default_name='polymask', output_stage=output_stage, extra_meta=extra_meta)
 
+    
 
     def build_zone_mask(self, data: Union[pd.DataFrame, str, Path] = None,
-                        order_zone: Optional[int] = None, order_cov: Optional[int] = None,
+                        order_sparse: int = 15, order_cov: Optional[int] = None,
                         fmt: str = 'ascii',
                         columns: Optional[Sequence[str]] = ['ra1','dec1','ra2','dec2'],
-                        bit_packed: Optional[bool] = None):
+                        bit_packed: bool = False, output_stage: Optional[str] = None):
         """
         Build a boolean HealSparse mask from rectangular sky zones. A zone is defined
         by ra boundaries (major circles) and dec limits (minor circles).
 
         Each input row describes a sky-aligned rectangle via two corner points
         (ra1, dec1) and (ra2, dec2) in degrees. The rectangles are pixelized at
-        `order_zone` to produce the set of HEALPix pixels covering it.
+        `order_sparse` to produce the set of HEALPix pixels covering it.
 
         Parameters
         ----------
@@ -3736,8 +3629,8 @@ class SkyMaskPipe:
             The zone definitions. If a DataFrame, it must contain the columns named
             in `columns`. If a path (string or Path), it is read according
             to `fmt` (delegated to astropy).
-        order_zone : int, optional
-            Sparse order to pixelize the zones. If None, falls back to `self.order_zone`
+        order_sparse : int, optional
+            Sparse order to pixelize the zones
         order_cov : int, optional
             Coverage order. If None, falls back to `self.order_cov`
         fmt : str, default "ascii"
@@ -3747,18 +3640,14 @@ class SkyMaskPipe:
             Columns for the two corners. If None, defaults to ("ra1", "dec1", "ra2", "dec2")
         bit_packed : bool, optional
             If True, return the ouput as bit-packed boolean map
-
+        output_stage : str, optional
+            Name for the ouput stage. If None, defaults to then canonical name 'zonemask'
+            
         Returns
         -------
         HealSparseMap
             The boolean (or bit-packed) mask is stored at `self.circmask` and also
             returned to prompt
-
-        Notes
-        -----
-        - All angles must be in degrees
-        - This method stores useful metadata (e.g., orders, format, input source,
-          pixel count, area) via `self._store_params("zonemask")`
 
         See Also
         --------
@@ -3766,55 +3655,149 @@ class SkyMaskPipe:
         """
         print('BUILDING ZONES MASK >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
         # Check if user wants specific orders, otherwise get from defaults
-        order_sparse = order_zone if order_zone is not None else self.order_zone
         ord_cov = order_cov if order_cov is not None else self.order_cov
 
         nside_sparse = 1<<order_sparse
         nside_cov = 1<<ord_cov
 
         # Create the empty boolean map *up front*
-        self.zonemask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_)
+        mask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_)
 
         # Perform pixelization
         pix = self.pixelate_zones(data, fmt=fmt, order=order_sparse, columns=columns)
         if pix is not None and len(pix) > 0:
-            self.zonemask.update_values_pix(pix, True)
+            mask.update_values_pix(pix, True)
 
         # Force packing if desired
-        if bit_packed: self.zonemask = self.zonemask.as_bit_packed_map()
+        if bit_packed: mask = mask.as_bit_packed_map()
 
         # Store calling/useful info in its own dictionary
-        area_deg2 = self.zonemask.get_valid_area(degrees=True)
-        npix = self.zonemask.n_valid
-        self._store_params('zonemask',
-            data=(str(data) if isinstance(data, (str, Path)) else "<mem>"),
-            order_zone=order_sparse, order_cov=ord_cov,
-            fmt=fmt, columns=columns, bit_packed=bit_packed,
-            pixels=npix, area_deg2=area_deg2)
-
+        area_deg2 = mask.get_valid_area(degrees=True)
+        npix = mask.n_valid
         print('--- Zones mask area                           :', area_deg2)
-        return self.zonemask
+        extra_meta = { 'data': (str(data) if isinstance(data, (str, Path)) else "<mem>"), 'fmt': fmt, 
+                       'columns': columns, 'bit_packed': bit_packed, 'pixels': npix, 'area_deg2': area_deg2 }
+        return self._finalize_stage(mask, default_name='zonemask', output_stage=output_stage, extra_meta=extra_meta)
 
 
-
-    def moc_from_stage_streaming(self, stage, order_forced: int | None = None,
-                                 rows_per_batch: int = 2048,   # how many coverage rows per micro-MOC
-                                 reduce_every: int = 16         # union-reduce frequency
-                                 ) -> MOC:
+        
+    def build_milkyway_mask(self, order_sparse: int = 8, order_cov: Optional[int] = None,
+                            b0_deg: float = 15., bulge_a_deg: float = 25., bulge_b_deg: float = 20.,
+                            bit_packed: bool = False, output_stage: Optional[str] = None):
         """
-        Build a MOC from a (possibly bit-packed) healsparse map WITHOUT materializing
-        all valid pixels at once.
+        Build a boolean HealSparse mask for the plane and bulge of the Milky Way.
 
-        Uses your `_iter_valid_by_covpix(hspmap)` which yields (covpix, arr) per coverage row.
-        We:
-          • coarsen each row's sparse-order pixels to the desired target order
-          • unique within the row (cheap)
-          • accumulate parent ipix for `rows_per_batch` rows → build a tiny MOC
-          • periodically union-reduce partial MOCs to keep memory bounded
+        Parameters
+        ----------
+        order_sparse : int, optional
+            Sparse order to pixelize the galaxy mask
+        order_cov : int, optional
+            Coverage order. If None, falls back to `self.order_cov`
+        b0_deg : float
+            Half-thickness of the Galactic plane band (|b| <= b0_deg)
+        bulge_a_deg : float
+            Semi-axis along Galactic longitude for the bulge ellipse (degrees)
+        bulge_b_deg : float
+            Semi-axis along Galactic latitude for the bulge ellipse (degrees)
+        bit_packed : bool, optional
+            If True, return the ouput as bit-packed boolean map
+        output_stage : str, optional
+            Name for the ouput stage. If None, defaults to then canonical name 'mwmask'
+            
+        Returns
+        -------
+        HealSparseMap
+            The boolean (or bit-packed) mask is stored at `self.mwmask` and also
+            returned to prompt
+        """
+        print('BUILDING MILKY WAY MASK >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
+        # Check if user wants specific orders, otherwise get from defaults
+        ord_cov = order_cov if order_cov is not None else self.order_cov
+
+        nside_sparse = 1<<order_sparse
+        nside_cov = 1<<ord_cov
+
+        # Create the empty boolean map up front
+        mask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_)
+
+        # Create MOC of the MW plane and bulge
+        moc_pb = SkyMaskPipe.gal_plane_bulge_moc(max_depth=order_sparse, b0_deg=b0_deg,
+                                                 bulge_a_deg=bulge_a_deg, bulge_b_deg=bulge_b_deg)
+
+        # Get pixels and update mwmask. No beed for facy streaming since its unnlikey to require high orders
+        pixels = moc_pb.flatten().astype(np.int64)
+        mask.update_values_pix(pixels, True)
+
+        # Force packing if desired
+        if bit_packed: mask = mask.as_bit_packed_map()
+
+        # Store calling/useful info in its own dictionary
+        area_deg2 = mask.get_valid_area(degrees=True)
+        npix = mask.n_valid
+        print('--- Milky Way mask area                          :', area_deg2)
+        extra_meta = { 'b0_deg': b0_deg, 'bulge_a_deg': bulge_a_deg, 'buge_b_deg': bulge_b_deg, 
+                       'pixels': npix, 'area_deg2': area_deg2 }        
+        return self._finalize_stage(mask, default_name='mwmask', output_stage=output_stage, extra_meta=extra_meta)
+
+        
+
+    @staticmethod
+    def moc_from_stage(stage, order_forced: int | None = None,
+                       rows_per_batch: int = 2048,    # how many coverage rows per micro-MOC
+                       progress: bool = True, pbar_kwargs: dict | None = None) -> MOC:
+        """
+        Build a MOC from a stage's healSparse boolean map without materializing all valid
+        pixels at once, by streaming sparse pixels inside coverage pixels.
+
+        This routine consumes coverage pixels one-by-one via ``_iter_valid_by_covpix(hsp)``,
+        immediately **coarsens** each row’s sparse pixels to the target order, performs
+        an in-row ``unique()``, accumulates a small batch of rows, builds a micro-MOC,
+        and **union-reduces** partial MOCs as it goes.
+
+        Parameters
+        ----------
+        stage : str or healSparse map
+            Either the name of a SkyMaskPipe stage attribute (e.g., ``"starmask"``),
+            or a healSparse boolean map object itself (regular or bit-packed).
+        order_forced : int, optional
+            Target MOC order (depth). By default the map’s ``order_sparse`` is used.
+        rows_per_batch : int, default 2048
+            Number of non-empty coverage pixels to accumulate before building each
+            micro-MOC.
+        progress : bool, default True
+            If True, display a tqdm progress bar over coverage rows. If tqdm is not
+            available, execution proceeds silently.
+        pbar_kwargs : dict, optional
+            Extra keyword arguments forwarded to ``tqdm.auto.tqdm`` (e.g.,
+            ``{"leave": True}``, ``{"desc": "Building MOC"}``).
+
+        Returns
+        -------
+        moc : mocpy.MOC
+            The union of all micro-MOCs at ``order_forced`` (or ``order_sparse`` if
+            not forced).
+
+
+        Memory behavior
+        ---------------
+        - Never calls ``hsp.valid_pixels`` on the whole map.
+        - Per row: coarsen **immediately** from ``order_sparse`` to target order
+          using parent mapping (NESTED scheme), then sort/unique within the row.
+        - Builds micro-MOCs every ``rows_per_batch`` rows and union-reduces partials
+          promptly to bound the number of large objects alive at once.
+
+        Assumptions
+        -----------
+        - Input healSparse map is in **NESTED** ordering (parent mapping via integer
+          division is used).
+        - ``_iter_valid_by_covpix(hsp)`` yields ``(covpix, arr)`` where ``arr`` is a
+          1-D array of sparse-order pixel indices (dtype convertible to int64) for
+          that coverage pixel. It may yield rows in any order.
         """
         from math import log2
+
         # Resolve stage -> healsparse map
-        hsp = stage if hasattr(stage, 'nside_sparse') else getattr(self, stage)
+        if hasattr(stage, 'nside_sparse'): hsp = stage
 
         order_sparse = int(round(log2(hsp.nside_sparse)))
         order_target = order_forced if order_forced is not None else order_sparse
@@ -3825,25 +3808,54 @@ class SkyMaskPipe:
         delta = order_sparse - order_target
         parent_factor = 4 ** delta if delta > 0 else 1
 
+        # Prepare tqdm (auto total if possible)
+        pbar = None
+        if progress:
+            total_covpix = None
+            try:
+                cov = getattr(hsp, "coverage_mask", None)
+                if cov is not None:
+                    cov = np.asarray(cov)
+                    if cov.dtype == np.bool_ or np.issubdtype(cov.dtype, np.bool_):
+                        total_covpix = int(np.count_nonzero(cov))
+                    else:
+                        # if it's an index array / anything else, use its length
+                        total_covpix = int(cov.size)
+                if total_covpix is None:
+                    # fallback: count iterator (usually only a few thousand rows)
+                    total_covpix = sum(1 for _ in _iter_covpix(hsp))
+            except Exception:
+                total_covpix = None  # show indeterminate bar if detection fails
+
+            try:
+                from tqdm.auto import tqdm
+                kb = dict(total=total_covpix, unit="row", dynamic_ncols=True, leave=False)
+                if pbar_kwargs:
+                    kb.update(pbar_kwargs)
+                pbar = tqdm(desc=f"Streaming pixels to build MOC at order {order_target}", **kb)
+            except Exception:
+                pbar = None  # tqdm not available; continue silently
+
         # Streaming accumulators
         micro_ipix = []   # list of np.ndarray[int64] at target order
         partials = []     # list of tiny MOCs to union later
         row_counter = 0
+        micros_built = 0
 
-        # --- main streaming loop (YOUR iterator signature) ---
+        # Main streaming loop over coverage pixels ------------------
         for _covpix, arr in _iter_valid_by_covpix(hsp):
-            if arr is None or arr.size == 0:
-                continue
+            if pbar is not None: pbar.update(1)
 
-            # ensure int64 without a copy when possible
+            if arr is None or arr.size == 0: continue
+
+            # Ensure int64 without a copy when possible
             arr = np.asarray(arr, dtype=np.int64, order='C')
 
             # Coarsen immediately (order_sparse → order_target)
             parents = (arr // parent_factor) if delta > 0 else arr
 
-            # Unique within the row (cheap, keeps the batch small)
-            if parents.size > 1 and (parents[1:] < parents[:-1]).any():
-                parents.sort()
+            # Unique within the row to keep the batch small
+            if parents.size > 1 and (parents[1:] < parents[:-1]).any(): parents.sort()
             parents = np.unique(parents)
 
             # Accumulate
@@ -3857,14 +3869,15 @@ class SkyMaskPipe:
                 micro_ipix.clear()
                 row_counter = 0
 
-                m = MOC.from_healpix_cells(
-                    ipix=ipix,
-                    depth=order_target,      # all at the same order now
-                    max_depth=order_target
-                )
-                partials.append(m)
+                # All at the same order_target now
+                m = MOC.from_healpix_cells(ipix=ipix, depth=order_target, max_depth=order_target)
 
-                # Union-reduce to avoid long chains (binary-ish reduction)
+                partials.append(m)
+                micros_built += 1
+                if pbar is not None:
+                    pbar.set_postfix_str(f"micros={micros_built} partials={len(partials)}")
+
+                # Union-reduce to avoid long chains (kept identical to your version)
                 while len(partials) >= 2:
                     a = partials.pop()
                     b = partials.pop()
@@ -3876,19 +3889,26 @@ class SkyMaskPipe:
             micro_ipix.clear()
             m = MOC.from_healpix_cells(ipix=ipix, depth=order_target, max_depth=order_target)
             partials.append(m)
+            micros_built += 1
+            if pbar is not None:
+                pbar.set_postfix_str(f"micros={micros_built} partials={len(partials)}")
+
+        # Close the bar before the potentially heavy final reduction
+        if pbar is not None:
+            pbar.close()
+            pbar = None
 
         # Final reduction / empty case
         if not partials:
-            return MOC.from_healpix_cells(
-                ipix=np.array([], dtype=np.int64),
-                depth=np.array([], dtype=np.int16),
-                max_depth=order_target
-            )
+            return MOC.from_healpix_cells(ipix=np.array([], dtype=np.int64),
+                   depth=np.array([], dtype=np.int16), max_depth=order_target)
 
         moc = partials[0]
         for p in partials[1:]:
             moc = moc.union(p)
         return moc
+
+
 
 
     @staticmethod
@@ -4152,5 +4172,100 @@ class SkyMaskPipe:
 
 
 
+    @staticmethod
+    def _compute_bitshift(nside_from, nside_to):
+        d = int(np.log2(nside_to) - np.log2(nside_from))
+        if d < 0 or (1 << d) * nside_from != nside_to:
+            raise ValueError("nside_randoms must be a power-of-two multiple of nside_sparse.")
+        return 2 * d  # NESTED: +2 bits per order
 
+
+
+    def makerans(self, stage: Union[str, "HealSparseMap"] = "mask", nr: int = 50_000, 
+                 file: Optional[os.PathLike[str] | str] = None, nside_randoms: Optional[int] = None, 
+                 rng: Optional[RandomState] = None, **kwargs) -> pd.DataFrame:
+        """
+        Generate uniform randoms over a HealSparse boolean (or bit-packed) map without materializing
+        the global valid-pixels list.
+
+        Parameters
+        ----------
+        stage : str
+            Mask stage name in this SkyMaskPipe (e.g., 'mask', 'foot', 'propmask', ...)
+        nr : int
+            Number of random points to generate.
+        file : str or None
+            If provided, path to a .parquet file to write (index=False).
+        nside_randoms : int or None
+            Target NESTED nside for placing randoms (must be a power-of-two multiple of map nside).
+            Defaults to min(2**23, nside_sparse * 8).
+        rng : np.random.RandomState or None
+            RNG to use. If None, uses np.random.RandomState().
+        **kwargs :
+            Extra kwargs passed to pandas.DataFrame.to_parquet().
+
+        Returns
+        -------
+        pandas.DataFrame
+            Columns: 'ra', 'dec' (degrees).
+        """
+        if rng is None: rng = np.random.RandomState()
+
+        # Resolve stage -> healsparse map
+        mk = stage if hasattr(stage, 'nside_sparse') else getattr(self, stage)
+        nside_sparse = mk.nside_sparse
+
+        # Choose default fine grid (power-of-two multiple of nside_sparse)
+        if nside_randoms is None:
+            nside_randoms = min(2**23, nside_sparse * (2**3))
+        bit_shift = self._compute_bitshift(nside_sparse, nside_randoms)
+
+        # ---------- Pass 1: counts per iterator chunk (streaming) ----------
+        counts = [pix.size for pix in mk.iter_valid_pixels_by_covpix()]
+        if not counts or nr <= 0:
+            df = pd.DataFrame({'ra': np.empty(0, dtype=float), 'dec': np.empty(0, dtype=float)})
+            if file:
+                df.to_parquet(file, index=False, **kwargs)
+                print("0 randoms written (empty mask).")
+            return df
+
+        counts = np.asarray(counts, dtype=np.int64)
+        total = counts.sum()
+        if total == 0:
+            df = pd.DataFrame({'ra': np.empty(0, dtype=float), 'dec': np.empty(0, dtype=float)})
+            if file:
+                df.to_parquet(file, index=False, **kwargs)
+                print("0 randoms written (empty mask).")
+            return df
+
+        alloc = rng.multinomial(nr, counts / total)
+
+        # ---------- Pass 2: sample within each iterator chunk ----------
+        ras, decs = [], []
+        for i, pix in enumerate(mk.iter_valid_pixels_by_covpix()):
+            take = int(alloc[i])
+            if take <= 0 or pix.size == 0:
+                continue
+
+            parents = np.asarray(pix, dtype=np.int64)  # absolute NESTED pixel ids @ nside_sparse
+            choice = rng.randint(0, parents.size, size=take)
+            parents_sel = parents[choice]
+
+            # Refine to nside_randoms (append random sub-bits)
+            subbits = rng.randint(0, 1 << bit_shift, size=take, dtype=np.int64)
+            randpix = (parents_sel << bit_shift) + subbits
+
+            ra, dec = hp.pix2ang(nside_randoms, randpix, nest=True, lonlat=True)
+            ras.append(ra); decs.append(dec)
+
+        rra  = np.concatenate(ras) if ras else np.empty(0, dtype=float)
+        rdec = np.concatenate(decs) if decs else np.empty(0, dtype=float)
+
+        df = pd.DataFrame({'ra': rra.astype(float, copy=False), 'dec': rdec.astype(float, copy=False)})
+
+        if file:
+            df.to_parquet(file, index=False, **kwargs)
+            print(f"{len(df)} randoms written to: {file}")
+
+        return df
 

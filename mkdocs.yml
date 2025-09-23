@@ -1,12 +1,29 @@
 site_name: Skykatana
 
 nav:
-  - Home: index.md
-  - Intro: intro.md
+  - Introduction: index.md
+  - Installation: install.md
+  - Example 1 - Masks for HSC: quick_example_hsc.md
+  - Example 2 - Masks for Rubin: quick_example_rubin.md
+  - Example 3 - Funny masks: bonus_example.md
+  - Healsparse map basics: hspbasic.md
+  - HATS & LSDB basics: hatsbasic.md
+  - Creating footmasks: creating_footmaps.md
+  - IO format: io.md
   - API: api.md
 
 theme:
-  name: readthedocs
+  name: material #dracula #readthedocs
+  logo: images/logo.png
+  favicon: images/sword-cross-custom.png
+  palette:
+    scheme: slate         # general color scheme
+    primary: blue grey    # top heading with title & search bar
+    accent: yellow        # hovering links
+  font:
+    text: Merriweather Sans
+    code: Red Hat Mono
+
 
 plugins:
 - search:
@@ -16,14 +33,40 @@ plugins:
         options:
           show_root_heading: yes
           docstring_style: numpy
+          docstring_section_style: table # or: table | spacy
+          summary: true
+          group_by_category: true
+          show_symbol_type_heading: true
+          show_symbol_type_toc: true
+          modernize_annotations: true
+          #show_docstring_description: true
+
+extra_css:
+  - css/mkdocstrings.css
+  - css/typography.css
+  - css/overrides.css
+  - css/notebook-styles.css
 
 # Optional: You can add mkdocstrings options to customize it
 markdown_extensions:
   - admonition
   - toc:
       permalink: true
-
-#  - admonition
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.details
+  - attr_list
+  - md_in_html
 
 extra:
   python_path: "src"  # Add your src folder to the Python path

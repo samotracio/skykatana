@@ -17,7 +17,7 @@ classifiers = [
     "Programming Language :: Python :: 3"]
 keywords = ["Astronomy", "Surveys", "Sky Masks"]
 
-dependencies = [ "lsdb", "healsparse", "tqdm", "healpy", "fitsio"]
+dependencies = [ "lsdb", "healsparse", "tqdm", "healpy", "fitsio", "pillow", "ipyaladin"]
 
 requires-python = ">=3.10"
 

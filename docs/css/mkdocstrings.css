@@ -1,0 +1,74 @@
+:root {
+    .doc-symbol-parameter::after {
+    content: "P";
+    }
+
+    .doc-symbol-type_parameter::after {
+    content: "P";
+    }
+
+    .doc-symbol-attribute::after {
+    content: "A";
+    }
+
+    .doc-symbol-function::after {
+    content: "F";
+    }
+
+    .doc-symbol-method::after {
+    content: "M";
+    }
+
+    .doc-symbol-class::after {
+    content: "C";
+    }
+
+    .doc-symbol-type_alias::after {
+    content: "T";
+    }
+
+    .doc-symbol-module::after {
+    content: "M";
+    }
+
+
+
+}
+
+
+# No need. Use typography.css
+#.md-typeset code {
+#    font-size: .45em;}
+
+/* expand header to accomodate larger logo */
+.md-header__button.md-logo img, .md-header__button.md-logo svg
+{
+    height: 2.5rem;
+}
+
+/* make tables more compact */
+.md-typeset table:not([class]) th,
+.md-typeset table:not([class]) td {
+  padding: 0.25rem 0.4rem;   /* default ~0.5rem; reduce both axes */
+  line-height: 1.4;          /* tighten text lines */
+  vertical-align: middle;    /* keep content centered */
+}
+
+
+/* Style ALL narrative paragraphs in the docstring that show up in the API after the signature */
+.md-typeset .doc.doc-contents > p {
+  border-left: 0.25rem solid #707070;
+  border-right: 0.25rem solid #707070;
+  padding: .4rem .6rem;
+  border-radius: .25rem;
+  margin: 0 0 .55rem 0.0rem;
+}
+/* …but de-style “Parameters/Returns/…” title lines which would inherit the above*/
+.md-typeset .doc.doc-contents > p:has(> .doc-section-title) {
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: .75rem 0 .25rem;   /* spacing for the title line */
+  font-weight: 600;
+}
+
