@@ -1,2 +1,8 @@
-mkdocs
-mkdocstrings[python]  # For Python code documentation
+mkdocs>=1.6
+mkdocs-material>=9.5
+pymdown-extensions>=10.8
+mkdocstrings>=0.25
+mkdocstrings-python>=1.10
+mkdocs-literate-nav>=0.6
+mkdocs-section-index>=0.3
+mkdocs-gen-files>=0.5
