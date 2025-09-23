@@ -30,6 +30,7 @@ plugins:
 - mkdocstrings:
     handlers:
       python:
+      	paths: [src]
         options:
           show_root_heading: yes
           docstring_style: numpy
