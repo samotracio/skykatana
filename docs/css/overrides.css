@@ -1,0 +1,38 @@
+/* Make the central content column wider on large screens */
+@media (min-width: 76.25em) { /* ~1220px, matches Material’s large breakpoint */
+  /* Overall page grid (affects header/search width, etc.) */
+  .md-grid {
+    max-width: 100rem; /* default is ~61rem; try 84–100rem */
+  }
+
+  /* Main article column */
+  .md-content__inner {
+    max-width: 80rem; /* default is ~61rem; adjust to taste */
+  }
+}
+
+/* Optional: only expand on very large/HiDPI screens */
+@media (min-width: 100rem) {
+  .md-content__inner { max-width: 90rem; }
+}
+
+
+/* Right sidebar ToC link colors for specific sections */
+.md-nav--secondary [data-md-component="toc"] a[href="#mask-building-ops"],
+.md-nav--secondary [data-md-component="toc"] a[href="#visualization"],
+.md-nav--secondary [data-md-component="toc"] a[href="#pixelization"],
+.md-nav--secondary [data-md-component="toc"] a[href="#auxiliary"],
+.md-nav--secondary [data-md-component="toc"] a[href="#io-methods"]{
+  color: #ffffff;                 /* red */
+  font-weight: 600;               /* optional emphasis */
+}
+
+/* Keep them red when active/focused/hovered */
+.md-nav--secondary [data-md-component="toc"] a[href="#mask-building-ops"]:is(:hover, :focus, .md-nav__link--active),
+.md-nav--secondary [data-md-component="toc"] a[href="#visualization"]:is(:hover, :focus, .md-nav__link--active),
+.md-nav--secondary [data-md-component="toc"] a[href="#pixelization"]:is(:hover, :focus, .md-nav__link--active),
+.md-nav--secondary [data-md-component="toc"] a[href="#auxiliary"]:is(:hover, :focus, .md-nav__link--active),
+.md-nav--secondary [data-md-component="toc"] a[href="#io-methods"]:is(:hover, :focus, .md-nav__link--active) {
+  color: #ffffff;
+}
+

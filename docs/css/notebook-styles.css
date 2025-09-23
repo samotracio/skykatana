@@ -1,0 +1,81 @@
+/*===================================  Dark theme   ================================== */
+[data-md-color-scheme="slate"] .met   {             /* methods & functions*/
+    background-color: rgb(39,51,61); 
+    color: rgb(222,219,142);
+    padding:3px 3px; 
+    border:1px solid rgb(78,115,128); 
+    border-radius:6px; }
+[data-md-color-scheme="slate"] .icode {            /* code & key=val within text*/
+    font-family: monospace; 
+    color: rgb(145,208,93); }
+[data-md-color-scheme="slate"] .sc    {            /* Skykatana label */
+    font-variant: small-caps; 
+    font-weight: bold; 
+    font-size: 1.1em; }
+[data-md-color-scheme="slate"] .note  {            /* for notes. replace with ammoition?*/
+    display:inline-block; 
+    background-color: rgb(23,80,130);
+    color:white; 
+    padding:6px; 
+    border-radius:6px; 
+    font-size:1em; }
+[data-md-color-scheme="slate"] .callout {          /* text between code */
+    border-left:6px solid rgb(99,99,99); 
+    border-right:6px solid rgb(99,99,99);
+    border-radius:6px; 
+    background: rgba(40,40,40,0.8); 
+    padding:8px 16px; 
+    font-size:1em; 
+    color: rgb(181,181,181); }
+[data-md-color-scheme="slate"] .st    {            /* stage label*/
+    color: rgb(255,255,255); 
+    padding:0 8px; font-weight:bold;
+    border-radius:12px; 
+    border:1px solid rgb(247,94,94); }
+[data-md-color-scheme="slate"] .sep1   {            /* separator 1*/  
+    border: 2px solid rgb(36, 104, 240);
+    width: 100%; }
+[data-md-color-scheme="slate"] .sep2   {            /* separator 2*/  
+    border: 2px solid rgb(187, 163, 42);
+    width: 100%; }
+[data-md-color-scheme="slate"] .emph1  {            /* emphasize 1 */  
+    color:rgb(255,107,107);
+    font-size:1.0em }
+[data-md-color-scheme="slate"] .mgroup  {            /* group titles in API */  
+    color:rgb(254, 228, 134);
+    font-size:1.1em }
+    
+/*===================================  Light theme   ================================== */
+[data-md-color-scheme="default"] .met   {          /* methods & functions*/
+    background-color: rgb(218,229,251); 
+    color: rgb(27,58,121);
+    padding:3px 3px; 
+    border:1px solid rgb(36,138,255); 
+    border-radius:6px; }
+[data-md-color-scheme="default"] .icode {          /* code & key=val within text*/
+    font-family: monospace; 
+    color: rgb(91,151,43); }
+[data-md-color-scheme="default"] .sc    {          /* Skykatana label */
+    font-variant: small-caps; 
+    font-weight: bold; }
+[data-md-color-scheme="default"] .note  {          /* for notes. replace with ammoition?*/
+    display:inline-block; 
+    background-color: rgb(91,144,251);
+    color:white; 
+    padding:6px; 
+    border-radius:6px; 
+    font-size:1em; }
+[data-md-color-scheme="default"] .callout {         /* text between code */
+    border-left:6px solid rgb(99,99,99); 
+    border-right:6px solid rgb(99,99,99);
+    border-radius:6px; 
+    background: rgb(255,255,255); 
+    padding:8px 16px; font-size:1em; }
+[data-md-color-scheme="default"] .st    {           /* stage label*/
+    color: rgb(162,93,93); 
+    padding:0 8px; 
+    font-weight:bold;
+    border-radius:12px; 
+    border:1px solid rgb(247,94,94); }
+
+
