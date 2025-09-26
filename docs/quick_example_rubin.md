@@ -126,7 +126,7 @@ client = Client(n_workers=3, threads_per_worker=1, memory_limit="6GiB")
 We have everything ready. Just choose the orders for pixelization and run
 
 ```python
-mkp.build_star_mask_online(starq=starq, order_star=15, order_cov=5, n_threads=1);
+mkp.build_star_mask_online(starq=starq, order_sparse=15, order_cov=5, n_threads=1);
 ```
 ```
     BUILDING STAR MASK >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
@@ -203,7 +203,7 @@ plt.legend();
 ```    
 ![png](images/output_27_1.png)    
 
-here is also new stage <span class='st'>mwmask</span> due to the Milky Way.
+there is also new stage <span class='st'>mwmask</span> due to the Milky Way.
 
 ```python
 center = SkyCoord(280*u.deg, -15*u.deg)  ;  fov = 50*u.deg
@@ -227,7 +227,7 @@ plt.legend();
 
 
 ### Saving stars
-<span class="sc">Skykatana</span> can also save the stars queried by setting <span class='icode'>save_stars=True</span>. This will save the stars of each chunk (with radius added) as a series of files stars_chunk_01.parquet, stars_chunk_02.parquet, etc.
+<span class="sc">Skykatana</span> can also save the stars queried by setting <span class='icode'>save_stars=True</span>. This will save the stars of each chunk (with radius added) as a series of files named stars_chunk_01.parquet, stars_chunk_02.parquet, stars_chunk_03.parquet, etc.
 
 Note however there will be repeated stars. This is because by construction the MOCs of each part are enlarged along their borders to include the effect of stars slighly outside their own area. If you need a unique list, apply a simple deduplication algorithm by ra-dec position.
 
@@ -258,7 +258,7 @@ mkp
     mask           : (ord/nside)cov=5/32   (ord/nside)sparse=15/32768 valid_pix=136180886  area=436.00 deg² pix_size=   6.4"
 ```
 
-Lets check this combined mask by plotting a zoomed MOC\
+Lets check this combined mask by plotting a zoomed MOC
 
 ```python
 center = SkyCoord(318*u.deg, -1*u.deg)  ;  fov = 1*u.deg

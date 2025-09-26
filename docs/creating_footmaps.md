@@ -75,7 +75,7 @@ The method <span class='met'>build_foot_mask()</span> accepts a `:::py3 sources`
 * a path string pointing to a file (in any format readable by astropy)
 
 ## Choosing the right order
-One way to create a footprint map is by pixelizing an input catalog of sources using <span class='met'>build_foot_mask()</span>. This catalog should be dense enough to prevent artificial holes but sparse enough to accurately trace boundaries and real holes. Sucha a catalog could be the parent sample from which your objects of interest were drawn. For example, if you are studying extremely red galaxies with specific color cuts in the gri bands, your input catalog could be all HSC objects classified as galaxies that have gri coverage. Sometimes, the precise sky area of a sample is not readily available or easy to obtain. In these cases, creating a footprint from a dense catalog can be a viable alternative to defining the survey boundaries.
+One way to create a footprint map is by pixelizing an input catalog of sources using <span class='met'>build_foot_mask()</span>. This catalog should be dense enough to prevent artificial holes but sparse enough to accurately trace boundaries and real holes. Such a catalog could be the parent sample from which your objects of interest were drawn. For example, if you are studying extremely red galaxies with specific color cuts in the gri bands, your input catalog could be all HSC objects classified as galaxies that have gri coverage. Sometimes, the precise sky area of a sample is not readily available or easy to obtain. In these cases, creating a footprint from a dense catalog can be a viable alternative to defining the survey boundaries.
 
 You can customize the `:::py3 order_sparse` parameter to fine-tune this process.
 

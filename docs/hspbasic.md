@@ -37,9 +37,9 @@ A **boolean HealSparse map** is a map whose values are just `True` or `False`. T
 
 For extremely high‑resolution boolean maps, HealSparse supports a **bit‑packed** representation:
 
-* *Storage*: Packs eight booleans into a single byte, cutting memory and disk usage by roughly a factor of eight compared to a normal boolean array.
-* *Performance*: Pixel lookups re main fast (bit tests within a byte) and iterating over *all* valid pixels requires scanning bits, so it’s slightly slower than a plain boolean array.
-* *Constraints*: Sentinel must be `:::py3 False`; the packing only applies to boolean maps.
+* *Storage*: packs eight booleans into a single byte, cutting memory and disk usage by roughly a factor of eight compared to a normal boolean array.
+* *Performance*: while pixel lookups remain fast (bit tests within a byte),  iterating over *all* valid pixels requires scanning bits, so it’s slightly slower than a plain boolean array.
+* *Constraints*: sentinel must be `:::py3 False`; the packing only applies to boolean maps.
   
 ---
 
@@ -58,7 +58,7 @@ For extremely high‑resolution boolean maps, HealSparse supports a **bit‑pack
 
 ### Choosing values
 * `:::py3 NSIDE_COVERAGE` controls how finely the “index” can localize data. Smaller NSIDE (coarser) → smaller index, but queries may read more empty fine pixels per coarse cell. Typical values for masks are 16, 32, 64 or 128.
-* `:::py3 NSIDE_SPARSE` sets the science resolution: pick this according to the angular detail you need (e.g., NSIDE 4096 for ~0.86 arcmin pixels).The table below shows for an order k, the nside (2<sup>n</sup>), number of pixels N<sub>pix</sub> (12Nside<sup>2</sup>) and pixel size defined by HEALpix.
+* `:::py3 NSIDE_SPARSE` sets the science resolution: pick this according to the angular detail you need (e.g., NSIDE 4096 for ~0.86 arcmin pixels).The table below shows for an order n, the nside (2<sup>n</sup>), number of pixels N<sub>pix</sub> (12Nside<sup>2</sup>) and pixel size defined by HEALpix.
 
 | n  | Nside | N<sub>pix</sub> | θ<sub>pix</sub> |
 |----|------------|-------------------|---------------------|

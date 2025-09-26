@@ -2023,7 +2023,7 @@ class SkyMaskPipe:
         mk = getattr(self, stage)
 
         # Use randoms for scatter plot
-        radec = self.makerans(stage=mk, nr=nr, file=None, nside_randoms=None, rng=None)
+        radec = self.makerans(stage=mk, nr=nr, file=None, rng=None)
         xx=radec['ra']
         yy=radec['dec']
         #xx, yy = hsp.make_uniform_randoms_fast(mk, nr)
@@ -4182,7 +4182,7 @@ class SkyMaskPipe:
 
 
     def makerans(self, stage: Union[str, "HealSparseMap"] = "mask", nr: int = 50_000, 
-                 file: Optional[os.PathLike[str] | str] = None, nside_randoms: Optional[int] = None, 
+                 file: Optional[os.PathLike[str] | str] = None, nside_randoms: int = 2**23, 
                  rng: Optional[RandomState] = None, **kwargs) -> pd.DataFrame:
         """
         Generate uniform randoms over a HealSparse boolean (or bit-packed) map without materializing
@@ -4197,8 +4197,7 @@ class SkyMaskPipe:
         file : str or None
             If provided, path to a .parquet file to write (index=False).
         nside_randoms : int or None
-            Target NESTED nside for placing randoms (must be a power-of-two multiple of map nside).
-            Defaults to min(2**23, nside_sparse * 8).
+            Target NESTED nside for placing randoms (must be a power-of-two multiple of map nside). Defaults to 2**23.
         rng : np.random.RandomState or None
             RNG to use. If None, uses np.random.RandomState().
         **kwargs :
@@ -4216,8 +4215,8 @@ class SkyMaskPipe:
         nside_sparse = mk.nside_sparse
 
         # Choose default fine grid (power-of-two multiple of nside_sparse)
-        if nside_randoms is None:
-            nside_randoms = min(2**23, nside_sparse * (2**3))
+        #if nside_randoms is None:
+        #    #nside_randoms = min(2**23, nside_sparse * (2**3))
         bit_shift = self._compute_bitshift(nside_sparse, nside_randoms)
 
         # ---------- Pass 1: counts per iterator chunk (streaming) ----------
