@@ -15,6 +15,8 @@ from matplotlib.axes import Axes
 from healsparse import HealSparseMap
 from matplotlib.figure import Figure
 from numpy.random import RandomState
+from reproject import reproject_from_healpix
+from scipy.ndimage import gaussian_filter
 # Supress info msgs from dask -> distributed.core INFO: Event loop was unresponsive in Nanny ...
 # which repeats a lot during pixelization of circles
 import logging
@@ -2608,7 +2610,337 @@ class SkyMaskPipe:
         if show: plt.show()
         return fig, ax, wcs
 
+    
+    @staticmethod
+    def frac_area_map(hsp_in: hsp.HealSparseMap, order_frac: int = 8, avg_edges: bool = False, 
+                      edge_value_max: float | None = None, 
+                      grow_k: int = 1, max_iters: int = 600, tol: float = 1e-4) -> hsp.HealSparseMap:
+        """
+        Compute the fractional area map of a healsparse map at a target HEALPix order. Optionally
+        apply a harmonic averaging step to remove the artificial low-fraction ring of pixels at
+        the footprint boundary.
+                
+        Parameters
+        ----------
+        hsp_in : healsparse.HealSparseMap
+            Input map
+        order_frac : int, default=8
+            Order at which to compute the fractional coverage. Larger ``order_frac`` means finer pixels.
+        avg_edges : bool, default=False
+            If ``True``, post-process the fractional map to correct the systematically low values 
+            that appear along the outer edge. Only a narrow **edge band**  (valid coarse pixels that 
+            touch any UNSEEN neighbor) is modified. All interior pixels remain fixed.
+        edge_value_max : float or None, default=None
+            When ``avg_edges=True``, restrict pixel changes to edge pixels whose initial fractional 
+            value is **≤ edge_value_max** (e.g., 0.15–0.30). Use this to target the undercounted pixels
+            only. If ``None``, modify the entire edge band regardless of value.
+        grow_k : int, default=1
+            Grow the inpaint region inward by this many HEALPix **k-rings** from the detected edge 
+            (0 = only the immediate edge ring).
+        max_iters : int, default=600
+            Maximum Gauss–Seidel iterations for the harmonic averaging on the HEALPix neighbor graph 
+            (each updated pixel becomes the mean of its finite neighbors).
+        tol : float, default=1e-4
+            Convergence threshold on the maximum absolute change within the averaging region between 
+            iterations. Iterations stop early when the change drops below this value.
 
+        Returns
+        -------
+        HealSparseMap (float) with pixel values between 0 and 1
+        """
+        # Create fractional area map for input stage
+        frac_hsp = hsp_in.fracdet_map(2**order_frac)
+
+        # Average edges if requested
+        if avg_edges:
+            print(f'Fractions at edge pixels are being averaged')
+            nside = int(frac_hsp.nside_sparse)
+            npix  = 12 * nside * nside
+        
+            # Dense NEST HEALPix array
+            arr_hp = frac_hsp.generate_healpix_map(nside=nside, nest=True).astype(float)
+            valid  = arr_hp != hp.UNSEEN
+            arr    = np.where(valid, arr_hp, np.nan)
+        
+            if not np.any(valid): return frac_hsp.copy()
+        
+            # Neighbors: shape (8, npix), with -1 where no neighbor
+            pix   = np.arange(npix, dtype=np.int64)
+            neigh = hp.get_all_neighbours(nside, pix, nest=True)
+        
+            # Find the edge ring: valid pixel with at least one UNSEEN neighbor
+            has_unseen_neighbor = np.zeros(npix, dtype=bool)
+            for i in range(8):
+                nb = neigh[i]
+                m = nb >= 0
+                # Neighbor is "unseen" if not valid there
+                has_unseen_neighbor[m] |= ~valid[nb[m]]
+        
+            edge0 = valid & has_unseen_neighbor
+        
+            # Optionally restrict to low-valued edge pixels
+            if edge_value_max is not None:
+                edge0 &= (arr <= float(edge_value_max))
+        
+            # Grow inward by k-rings within the valid domain
+            inpaint = edge0.copy()
+            for _ in range(int(grow_k)):
+                touch = np.zeros(npix, dtype=bool)
+                for i in range(8):
+                    nb = neigh[i]
+                    m  = nb >= 0
+                    # any neighbor in current inpaint band?
+                    touch[m] |= inpaint[nb[m]]
+                inpaint |= (valid & touch)
+        
+            # Fixed (Dirichlet) set: all valid pixels not in the inpaint band
+            fixed = valid & ~inpaint
+        
+            # If no unknown pixels (or no anchors), just return original
+            idx_unknown = np.flatnonzero(inpaint)
+            if idx_unknown.size == 0 or not np.any(fixed):  return frac_hsp.copy()
+        
+            # Initialize unknowns with neighbor means
+            out = arr.copy()
+            def neighbor_mean_for_unknowns(values, idx_unknown, neigh):
+                Nu = idx_unknown.size
+                sums   = np.zeros(Nu, dtype=float)
+                counts = np.zeros(Nu, dtype=float)
+                for i in range(8):
+                    nb = neigh[i, idx_unknown]     # neighbors of each unknown pixel
+                    m  = nb >= 0
+                    if not np.any(m): 
+                        continue
+                    vals = values[nb[m]]
+                    f = np.isfinite(vals)
+                    if np.any(f):
+                        sums[m]   += np.where(f, vals, 0.0)
+                        counts[m] += f.astype(float)
+                mean = np.full(Nu, np.nan, dtype=float)
+                ok = counts > 0
+                mean[ok] = sums[ok] / counts[ok]
+                return mean
+        
+            init = neighbor_mean_for_unknowns(out, idx_unknown, neigh)
+            out[idx_unknown] = np.where(np.isfinite(init), init, out[idx_unknown])
+        
+            # Gauss–Seidel harmonic updates on the inpaint band
+            for _ in range(int(max_iters)):
+                old = out[idx_unknown].copy()
+                new = neighbor_mean_for_unknowns(out, idx_unknown, neigh)
+                # keep previous value where no finite neighbors are available
+                use = np.isfinite(new)
+                out[idx_unknown[use]] = new[use]
+                delta = np.nanmax(np.abs(out[idx_unknown] - old))
+                if not np.isfinite(delta) or delta < tol:
+                    break
+        
+            # Clip to [0,1] and convert back to HealSparse
+            out = np.clip(out, 0.0, 1.0)
+            hp_arr = np.where(np.isfinite(out), out, hp.UNSEEN)
+            try:
+                frac_hsp = hsp.HealSparseMap(healpix_map=hp_arr, nside_coverage=frac_hsp.nside_coverage, nest=True)
+            except TypeError:
+                frac_hsp = hsp.HealSparseMap.convert_healpix_map(hp_arr, nside_coverage=frac_hsp.nside_coverage, nest=True)
+
+        
+        print(f'Fractional area map created at order {order_frac}: {frac_hsp.n_valid} valid pixels')
+        return frac_hsp
+
+        
+    
+    def show_fracmap(self, stage: Union[HealSparseMap, str], order_frac: int = 8, ax=None, wcs=None,
+        center: SkyCoord | None = None, fov: Angle | None = None,
+        frame: str = "icrs", projection: str = "SIN", figsize: tuple[float, float] = (10.0, 5.0),
+        # image props
+        vmin: float = 0.0, vmax: float = 1.0, cmap: str | None = None,
+        alpha: float = 1.0, order: str | int | None = "nearest-neighbor",
+        # contours
+        thresholds: float | Sequence[float] | None = None,
+        contour_smooth: dict | None = None, contour_kwargs: dict | None = None,
+        contour_label: bool | str = False, contour_label_kwargs: dict | None = None,
+        # z-order / colorbar
+        zorder_img: float = 1.0, zorder_contour: float = 2.0,
+        colorbar: bool = True,
+        avg_edges: bool = False
+    ):
+        """
+        Render a **fractional area map** for a pipeline stage or healsparse map and display it on WCS axes,
+        optionally overlaying one or more isocontours. Works in two modes:
+        
+        Parameters
+        ----------
+        stage : healsparse.HealSparseMap or str
+            The stage or map to visualize.
+        order_frac : int, optional
+            HEALPix order to compute the coarse fractional map. Larger orders give finer pixels. Default is 8.
+        ax, wcs : matplotlib.axes._axes.Axes, mocpy.moc.WCS, optional
+            When both are supplied, the function overlays the image onto the provided WCS view. If either 
+            is `None`, a new figure is create at `center`+`fov`.
+        center : astropy.coordinates.SkyCoord, optional
+            Sky center for **Create mode**. Must be provided when `ax`/`wcs` are not.
+        fov : astropy.coordinates.Angle, optional
+            Field of view for **Create mode**. Must be provided when `ax`/`wcs` are not.
+        frame : {'icrs', 'galactic', ...}, optional
+            Coordinate system used to construct the WCS. Default 'icrs'.
+        projection : {'SIN','TAN','AIT', ...}, optional
+            WCS projection passed to `mocpy.WCS` (e.g., 'SIN' to match `plot_moc`). Default 'SIN'.
+        figsize : tuple of float, optional
+            Figure size when a new figure is created. Default (10.0, 5.0).
+        
+        Image Parameters
+        ----------------
+        vmin, vmax : float, optional
+            Color stretch limits for the fractional image. Defaults 0.0–1.0.
+        cmap : str or None, optional
+            Matplotlib colormap name. If `None`, MPL default is used.
+        alpha : float, optional
+            Opacity of the fractional image layer. Default 1.0.
+        order : {'nearest-neighbor','bilinear'}. Use `'nearest-neighbor'` for mask-like maps and `'bilinear'` 
+            for softer display. Default 'nearest-neighbor'.
+        
+        Contour Parameters
+        ------------------
+        thresholds : float or sequence of float, optional
+            One or more fraction levels (e.g., `0.3`, or `[0.3, 0.5, 0.7]`) to draw as contours.
+        contour_smooth : dict or None, optional
+            Optional smoothing for the contours. Supported method is 
+            `{'method': 'gaussian', 'sigma_pix': <float>}` where `sigma_pix` is the Gaussian
+            sigma in **display pixels** (typ. 1–3). If `None`, no smoothing is applied.
+        contour_kwargs : dict or None, optional
+            Extra kwargs forwarded to `ax.contour` (e.g., `{'colors':'w','linewidths':1.2}`).
+        contour_label : bool or str, optional
+            If `True`, label each contour with a default format `f={level:.2f}`.
+            If a string (e.g., `'f={level:.2f}'`), it is used as the label format.
+        contour_label_kwargs : dict or None, optional
+            Extra kwargs to `ax.clabel` (e.g., `{'fontsize': 9, 'inline_spacing': 10}`).
+        
+        Layering / colorbar
+        -------------------
+        zorder_img : float, optional
+            Z-order for the fractional image (useful when layering under a MOC border). Default 1.0.
+        zorder_contour : float, optional
+            Z-order for contour lines. Default 2.0.
+        colorbar : bool, optional
+            If `True`, attach a colorbar. Default True.
+        
+        Edge correction
+        ---------------
+        avg_edges : bool, optional
+            If `True`, the fractional map produced is post-processed with a harmonic averaging that 
+            fixes the the artificial low-fraction of boundary pixels. Default False.
+        
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            The figure used (existing or newly created).
+        ax : WCSAxes
+            The WCS-aware Matplotlib axes the content was drawn into.
+        wcs : mocpy.moc.WCS
+            The mocpy WCS object used to build the axes (handy for subsequent layers).
+        im : matplotlib.image.AxesImage
+            The image artist returned by `imshow` for the fractional map.
+        CS : matplotlib.contour.QuadContourSet or None
+            The contour set, if `thresholds` were provided; otherwise `None`.
+        """
+        
+        # Choose stage based on input healsparse map or the name of stage in a pipeline
+        if hasattr(stage, 'valid_pixels'):
+            stage = stage
+        else:
+            stage = getattr(self, stage)
+
+        # Create fractional area map for input stage
+        frac_map = SkyMaskPipe.frac_area_map(stage, order_frac=order_frac, avg_edges=avg_edges)
+        #frac_map = stage.fracdet_map(2**order_frac)
+        #print(f'Fractional area map created at order {order_frac}: {frac_map.n_valid} valid pixels')
+        
+        # Create axes/wcs or take from the input keyworks ------------------------
+        created_context = False
+        if (ax is None) or (wcs is None):
+            if center is None or fov is None:
+                raise ValueError("When ax/wcs are not provided, you must pass `center` and `fov`.")
+            fig = plt.figure(figsize=figsize)
+            with WCS(fig, fov=fov, center=center, coordsys=frame,
+                     projection=projection, rotation=Angle(0, u.deg)) as _wcs:
+                ax = fig.add_subplot(1, 1, 1, projection=_wcs)
+                # match your plot_moc axis formatting
+                lon = ax.coords['ra']; lat = ax.coords['dec']
+                lon.set_format_unit(u.deg, decimal=True, show_decimal_unit=True)
+                lat.set_format_unit(u.deg, decimal=True, show_decimal_unit=True)
+                ax.set_xlabel("ra"); ax.set_ylabel("dec")
+                ax.grid(color="black", linestyle="dotted")
+                wcs = _wcs
+                created_context = True
+        else:
+            fig = ax.figure
+    
+        # Get the header from mocpy WCS and compute nx,ny from CRPIX1&2 -----------
+        hdr = wcs.to_header()
+        nx = int(round(2.0 * float(hdr['CRPIX1'])))
+        ny = int(round(2.0 * float(hdr['CRPIX2'])))
+        
+        # Get rid of UNSEEN values and reproject -----------------------------------
+        vals = frac_map.generate_healpix_map(nside=frac_map.nside_sparse, nest=True).astype(float)
+        vals[vals == hp.UNSEEN] = np.nan
+        arr, _ = reproject_from_healpix((vals, 'icrs'), ax.wcs, shape_out=(ny, nx), nested=True, order=order )
+    
+        # Draw image --------------------------------------------------------------
+        im = ax.imshow(arr, origin='lower', vmin=vmin, vmax=vmax, cmap=cmap,
+                       alpha=alpha, zorder=zorder_img)
+    
+        # Draw contours  ----------------------------------------------------------
+        CS = None
+        if thresholds is not None:
+            if np.isscalar(thresholds):
+                levels = [float(thresholds)]
+            else:
+                levels = [float(t) for t in thresholds]
+            levels = sorted({t for t in levels if np.isfinite(t)})
+    
+            ck = dict(zorder=zorder_contour)
+            if contour_kwargs:
+                ck.update(contour_kwargs)
+    
+            arr_for = np.array(arr, copy=True)
+            finite = np.isfinite(arr_for)
+    
+            method = (contour_smooth or {}).get('method', None)
+            if method in (None, 'gaussian'):
+                if method == 'gaussian':
+                    wgt = finite.astype(float)
+                    a0  = np.where(finite, arr_for, 0.0)
+                    sigma_pix = float((contour_smooth or {}).get('sigma_pix', 1.5))
+                    num = gaussian_filter(a0,  sigma=sigma_pix, mode='nearest')
+                    den = gaussian_filter(wgt, sigma=sigma_pix, mode='nearest')
+                    arr_for = np.where(den > 0, num/den, np.nan)
+    
+                masked = np.ma.array(arr_for, mask=~finite)
+                CS = ax.contour(masked, levels=levels, **ck)
+    
+                if contour_label:
+                    fmt = contour_label if isinstance(contour_label, str) else 'f={level:.2f}'
+                    fmt_map = {lvl: fmt.format(level=lvl) for lvl in levels}
+                    lbl_kwargs = dict(inline=True, inline_spacing=10, fmt=fmt_map, fontsize=9)
+                    if contour_label_kwargs: lbl_kwargs.update(contour_label_kwargs)
+                    texts = ax.clabel(CS, CS.levels, **lbl_kwargs)
+                    try:
+                        import matplotlib.patheffects as pe
+                        for t in texts:
+                            t.set_path_effects([pe.withStroke(linewidth=1.5, foreground='black')])
+                    except Exception:
+                        pass
+            else:
+                raise ValueError(f"Unknown contour_smooth method: {method!r}")
+    
+        if colorbar:
+            cb = plt.colorbar(im, ax=ax, pad=0.02)
+            cb.set_label('masked fraction')
+    
+        # Return everything in case the user need to keep plotting
+        return fig, ax, wcs, im, CS
+
+        
 
     @staticmethod
     def add_moca(alwidget, stage: Union[HealSparseMap, str], color: str = "red", opacity: float = 0.25,
