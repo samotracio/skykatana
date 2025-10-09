@@ -41,6 +41,7 @@ icon: simple/autoprefixer
         - plot_srcs
         - plot_moc
         - plot_moca
+        - plot_fracmap
         - add_moca
         - moc_from_stage
 
@@ -79,6 +80,7 @@ icon: simple/autoprefixer
         - remove_isopixels
         - erode_borders
         - gal_plane_bulge_moc
+        - frac_area_map
         - stage_meta
 
 ## <span class='mgroup'>:material-label-multiple-outline: IO Methods</span>

@@ -303,3 +303,102 @@ You can continue adding stages to the same widet with <span class='met'>add_moca
     receive a huge MOC and might become unresponsive. Best practice is to force a low order first, and then rise it untill results are statisfactory.
 
 
+## 6. Fractional area maps
+When investigating the effect of stars and other sources, a useful statistical measure is the fractional area masked out. That is, for a given order, the fractional area is the fraction of sparse pixels masked by those objects. For example, in dense regions near the galatic plane the number of pixels "occupied" by stars can be so high that this fraction can evan approach a value of one. In constrast, zones away from crowded stellar fields are expected to show a much lower fraction.
+
+Healsparse provides a very efficient method to estimate these fractions. Based on it, <span class="sc">Skykatana</span> implements a convenient method (<span class='met'>frac_area_map()</span>), that optionally replaces the pixel around edges, which by construction
+have sistematically lower fractions, by local harmonic average values. The result is a map whose (floating point) values are between 0 and 1. For visualiztion, <span class='met'>plot_fracmap()</span> can automatically calculate the fractional map of any stage, generate its 2D image representation, and overlay it over a WCS axes with optional contour levels.
+
+Lets create the fractional map of our <span class='st'>starmask</span> at order 8, which means the fraction is considered over pixels of about 14 arcmin size.
+
+```python
+center = SkyCoord(279*u.deg, -10*u.deg)  ;  fov = 31*u.deg
+fig, ax, wcs, im, cs = mkp.plot_fracmap(stage='starmask', center=center, fov=fov, figsize=[13,5], order_frac=8, avg_edges=True, 
+                                        thresholds=[0.4,0.5], contour_smooth={'method':'gaussian', 'sigma_pix':3.0})
+```
+```
+    Fractions at edge pixels are being averaged
+    Fractional area map created at order 8: 13921 valid pixels
+```
+![png](images/output_53_2.png)
+    
+!!! Note "Tip for interactive display"
+
+    If you install and enable the ipympl interative Jupyter backend, hovering the mouse over the image will show interactively the value of the
+    fractional map.
+
+Once you find a threshold suitable for the purposes of your mask, just use <span class='met'>build_prop_mask()</span> to construct it.
+
+```python
+frac = SkyMaskPipe.frac_area_map(mkp.starmask, order_frac=6, avg_edges=True)
+mkp.build_prop_mask(prop_maps=[frac],thresholds=[0.4],comparisons=['lt'],output_stage='goodmask', order_sparse=6, order_cov=5)
+```
+```
+    Fractions at edge pixels are being averaged
+    Fractional area map created at order 6: 985 valid pixels
+    BUILDING PROPERTY MAP >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    --- Propertymap mask area                       : 578.273321550494
+```
+
+And visualize everthing together
+
+```python
+center = SkyCoord(279*u.deg, -10*u.deg)  ;  fov = 31*u.deg
+fig, ax, wcs, im, cs = mkp.plot_fracmap(stage='starmask', center=center, fov=fov, figsize=[13,5], order_frac=8, avg_edges=True, 
+                                        thresholds=[0.4,0.5], contour_smooth={'method':'gaussian', 'sigma_pix':3.0})
+fig, ax, wcs = mkp.plot_moc(stage='goodmask', center=center, fov=fov, ax=ax, wcs=wcs, color='r', alpha=0.7, order_force=6)
+```
+```
+    Fractions at edge pixels are being averaged
+    Fractional area map created at order 8: 13921 valid pixels
+    Retrieving pixels...
+    Found 689 pixels
+    Creating display moc from pixels...
+    MOC max_order is 6 --> degrading forcedly to 6...
+    Drawing plot...
+``` 
+![png](images/output_58_3.png)
+
+Refine this mask a little more. We went down in order to take advantage of the averaging, so lets go back to the order of the search stage.
+
+```python
+mkp.change_sparse_order(stage='goodmask', order=12, inplace=True)
+```
+```
+    [change_sparse_order] goodmask requested upgrade o6 → o12
+    [change_sparse_order] goodmask done: o12 (NSIDE=4096), cov=o5, n_valid=2,822,144, encoding=bool
+```
+
+And intersect this <span class='st'>goodmask</span> with the search stage while subtracting the Milky Way mask. This will get rid of the peaks of the coarser fractional map around the edges while preserving a "smooth" trasition across the threshold boundary.
+
+```python
+mkp.combine(positive=[('propmask','goodmask')], negative=['mwmask'], order_out=12, order_cov=5, output_stage='bettermask')
+```
+```
+    [combine] aligning coverage for 'propmask' : c5 → c5
+    [combine] aligning coverage for 'goodmask' : c5 → c5
+    [combine] aligning coverage for 'mwmask' : c5 → c5
+    [combine] target=(o12, c5), work_order=12, r2=1
+    [combine:&] group of 2 stages: orders=[12, 12] -> work 12
+    [combine] done: order_out=12 (NSIDE=4096), order_cov=5 (NSIDE=32), valid_pix=2,344,698, area=480.442 deg², bit_packed=True
+```
+
+```python
+center = SkyCoord(279*u.deg, -10*u.deg)  ;  fov = 31*u.deg
+fig, ax, wcs = mkp.plot_moc(stage='propmask', center=center, fov=fov, figsize=[13,5], color='g', order_force=12)
+fig, ax, wcs = mkp.plot_moc(stage='bettermask', ax=ax, wcs=wcs, color='r', alpha=0.4, order_force=12)
+```
+```
+    Retrieving pixels...
+    Found 6015370 pixels
+    Creating display moc from pixels...
+    MOC max_order is 12 --> degrading forcedly to 12...
+    Drawing plot...
+    Retrieving pixels...
+    Found 2344698 pixels
+    Creating display moc from pixels...
+    MOC max_order is 12 --> degrading forcedly to 12...
+    Drawing plot...
+``` 
+![png](images/output_63_1a.png)
+    
