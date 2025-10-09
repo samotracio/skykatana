@@ -2749,7 +2749,7 @@ class SkyMaskPipe:
 
         
     
-    def show_fracmap(self, stage: Union[HealSparseMap, str], order_frac: int = 8, ax=None, wcs=None,
+    def plot_fracmap(self, stage: Union[HealSparseMap, str], order_frac: int = 8, ax=None, wcs=None,
         center: SkyCoord | None = None, fov: Angle | None = None,
         frame: str = "icrs", projection: str = "SIN", figsize: tuple[float, float] = (10.0, 5.0),
         # image props
@@ -2787,9 +2787,6 @@ class SkyMaskPipe:
             WCS projection passed to `mocpy.WCS` (e.g., 'SIN' to match `plot_moc`). Default 'SIN'.
         figsize : tuple of float, optional
             Figure size when a new figure is created. Default (10.0, 5.0).
-        
-        Image Parameters
-        ----------------
         vmin, vmax : float, optional
             Color stretch limits for the fractional image. Defaults 0.0–1.0.
         cmap : str or None, optional
@@ -2798,9 +2795,6 @@ class SkyMaskPipe:
             Opacity of the fractional image layer. Default 1.0.
         order : {'nearest-neighbor','bilinear'}. Use `'nearest-neighbor'` for mask-like maps and `'bilinear'` 
             for softer display. Default 'nearest-neighbor'.
-        
-        Contour Parameters
-        ------------------
         thresholds : float or sequence of float, optional
             One or more fraction levels (e.g., `0.3`, or `[0.3, 0.5, 0.7]`) to draw as contours.
         contour_smooth : dict or None, optional
@@ -2814,18 +2808,12 @@ class SkyMaskPipe:
             If a string (e.g., `'f={level:.2f}'`), it is used as the label format.
         contour_label_kwargs : dict or None, optional
             Extra kwargs to `ax.clabel` (e.g., `{'fontsize': 9, 'inline_spacing': 10}`).
-        
-        Layering / colorbar
-        -------------------
         zorder_img : float, optional
             Z-order for the fractional image (useful when layering under a MOC border). Default 1.0.
         zorder_contour : float, optional
             Z-order for contour lines. Default 2.0.
         colorbar : bool, optional
             If `True`, attach a colorbar. Default True.
-        
-        Edge correction
-        ---------------
         avg_edges : bool, optional
             If `True`, the fractional map produced is post-processed with a harmonic averaging that 
             fixes the the artificial low-fraction of boundary pixels. Default False.
