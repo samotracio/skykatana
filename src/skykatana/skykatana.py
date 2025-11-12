@@ -1431,7 +1431,8 @@ class SkyMaskPipe:
         starmask : healsparse.HealSparseMap
             The star mask as a `HealSparseMap`, also stored as `self.starmask` when `output_stage` is None
         """
-        from lsdb.core.search.moc_search import MOCSearch   # important import!
+        # from lsdb.core.search.moc_search import MOCSearch   # this was for lsdb 0.6.4
+        from lsdb.core.search.region_search import MOCSearch  # important import!
 
         print('BUILDING STAR MASK >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
         if not(isinstance(starq, dict)): raise Exception("starq must be a valid dictionary")
@@ -1473,7 +1474,7 @@ class SkyMaskPipe:
                                 columns=starq['columns'],
                                 search_filter=MOCSearch(moc),
                                 filters=[["phot_g_mean_mag", ">", starq['gaia_gmag_lims'][0]],
-                                        ["phot_g_mean_mag", "<", starq['gaia_gmag_lims'][1]]] )
+                                        ["phot_g_mean_mag", "<=", starq['gaia_gmag_lims'][1]]] )
 
         # Split moc parameters
         max_area_sing     = starq.get('max_area_single',   800.0)
