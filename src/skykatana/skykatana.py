@@ -4,12 +4,13 @@ from astropy.table import Table, join
 from astropy.coordinates import Angle, Latitude, Longitude, SkyCoord
 import astropy.units as u
 import lsdb
+from lsdb.core.search.region_search import MOCSearch
 from mocpy import MOC, WCS
 from tqdm import tqdm
 import re, json, os, shutil, tempfile, fitsio, gc, math, threading
 from pathlib import Path, PosixPath
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Iterable, Tuple, Union, Optional, Any, Dict, Sequence, List
+from typing import Iterable, Tuple, Union, Optional, Any, Dict, Sequence, List, Callable, Mapping
 from numpy.typing import NDArray
 from matplotlib.axes import Axes
 from healsparse import HealSparseMap
@@ -22,7 +23,52 @@ from scipy.ndimage import gaussian_filter
 import logging
 logging.getLogger('distributed.core').setLevel(logging.ERROR)
 
+from dataclasses import dataclass
+# Optional monotonic spline interpolation (preferred). Fallback is linear.
+try:
+    from scipy.interpolate import PchipInterpolator  # type: ignore
+    _HAS_PCHIP = True
+except Exception:
+    PchipInterpolator = None
+    _HAS_PCHIP = False
 
+
+def healpix_pixel_size_arcsec(nside: int) -> float:
+    """Approx HEALPix pixel linear scale (arcsec) for NSIDE."""
+    return 206265.0 * np.sqrt(np.pi / 3.0) / float(nside)
+
+
+def _monotonicize_increasing(y: np.ndarray) -> np.ndarray:
+    """Force non-decreasing y via cumulative max (guards small noise)."""
+    y = np.asarray(y, dtype=float).ravel()
+    return np.maximum.accumulate(y)
+
+
+def invert_radius_at_level(r_arcsec: np.ndarray, p: np.ndarray, level: float) -> float:
+    """
+    Invert a (nearly) monotonic increasing profile p(r) to find r(level).
+    Uses monotonicized p and linear inversion in (p,r).
+    """
+    r = np.asarray(r_arcsec, dtype=float).ravel()
+    p = np.asarray(p, dtype=float).ravel()
+    if r.size != p.size or r.size == 0:
+        return float("nan")
+
+    o = np.argsort(r)
+    r, p = r[o], p[o]
+    keep = np.concatenate(([True], np.diff(r) > 0))
+    r, p = r[keep], p[keep]
+    if r.size == 0:
+        return float("nan")
+
+    p_m = _monotonicize_increasing(p)
+    lvl = float(level)
+
+    if lvl <= p_m[0]:
+        return float(r[0])
+    if lvl >= p_m[-1]:
+        return float(r[-1])
+    return float(np.interp(lvl, p_m, r))
 
 
 # Numba auxiliary kernels (compiled)
@@ -392,6 +438,325 @@ def _write_stage_fits_bitpack(stage_path: str | os.PathLike, hspmap,
         _flush()
 
 
+#############################################################
+def _write_stage_fits_offval(stage_path, hspmap, rows_per_batch=50_000, sentinel=0.0):
+    """
+    Write a single SkyMaskPipe *floating* stage to disk as an OFFVAL FITS table.
+
+    This function serializes a floating-point map into a streaming FITS binary table 
+    using an **offset/value (OFFVAL)** representation. For each coverage pixel (row), 
+    only the fine-pixel offsets that carry non-sentinel values are written, together 
+    with their corresponding float values. Rows are buffered and appended in batches 
+    to balance I/O and memory usage.
+
+    Parameters
+    ----------
+    stage_path : str or os.PathLike
+        Output file path for the FITS stage.
+    hspmap : healsparse.HealSparseMap
+        The stage map to be serialized (a floating-point healsparse map, float32 or float64).
+    rows_per_batch : int, default=50000
+        Number of FITS table rows written per batch. Higher values may improve
+        I/O performance at the cost of larger memory usage.
+    sentinel : float, default=0.0
+        Sentinel value representing “missing / not present” pixels. Sentinel-valued
+        pixels are *dropped* from the output to keep the encoding sparse. If NaN is
+        used as sentinel, NaN-valued pixels are dropped.
+
+    Returns
+    -------
+    None
+        Writes the stage to `stage_path`.
+
+    Notes
+    -----
+    - The output FITS file contains a binary table with one row per *coverage pixel*:
+
+        * ``COVPIX`` (K) : int64 coverage pixel index
+        * ``ENC``   (B) : uint8 occupancy flag (always 1 for written rows)
+        * ``NLEN``  (J) : int32 number of entries in this row
+        * ``OFF``   (PJ()) : variable-length int32 offsets in [0, NFINE-1]
+        * ``VAL``   (PE()/PD()) : variable-length float32/float64 values
+
+      Offsets are defined relative to the coverage pixel base index
+      ``base = COVPIX * NFINE``, where ``NFINE = (NSIDE_SPA / NSIDE_COV)^2``.
+
+    - The header stores geometry and encoding metadata:
+
+        * ``NSIDE_COV``, ``NSIDE_SPA``, ``NFINE``
+        * ``DTYPE`` = 'float32' or 'float64'
+        * ``ENCOD`` = 'OFFVAL'
+        * ``SENTINEL`` = sentinel value (or NaN)
+
+    - Pixels are sorted by (coverage pixel, offset) to allow efficient streaming.
+      Duplicate offsets within a row are handled defensively by keeping the last
+      occurrence (stable behavior).
+    """
+    nside_cov = int(hspmap.nside_coverage)
+    nside_spa = int(hspmap.nside_sparse)
+    if (nside_spa % nside_cov) != 0:
+        raise ValueError("nside_sparse must be an integer multiple of nside_coverage")
+    nfine = (nside_spa // nside_cov) ** 2
+
+    dt = np.dtype(hspmap.dtype)
+    if dt not in (np.float32, np.float64):
+        raise TypeError(f"OFFVAL writer requires float32/float64, got {dt}")
+    val_fits_type = "E" if dt == np.float32 else "D"
+
+    # NOTE: if your project uses a different valid-pixel accessor, mirror it here
+    pix = hspmap.valid_pixels
+    vals = hspmap[pix].astype(dt, copy=False)
+
+    # Drop sentinel-valued pixels (keeps I/O sparse; for sentinel=0.0, avoids writing outside-mask)
+    if np.isnan(sentinel):
+        keep = ~np.isnan(vals)
+    else:
+        keep = (vals != sentinel)
+    pix = pix[keep]
+    vals = vals[keep]
+
+    # Group by coverage pixel
+    covpix = pix // nfine
+    off = (pix - covpix * nfine).astype(np.int32, copy=False)
+
+    # Sort by (covpix, off) for streaming grouped rows
+    order = np.lexsort((off, covpix))
+    covpix = covpix[order]
+    off = off[order]
+    vals = vals[order]
+
+    fits = fitsio.FITS(stage_path, "rw", clobber=True)
+
+    batch_cov, batch_enc, batch_nlen, batch_off, batch_val = [], [], [], [], []
+
+    table_created = False
+
+    def flush():
+        nonlocal table_created
+        if not batch_cov:
+            return
+
+        arr_cov  = np.asarray(batch_cov, dtype=np.int64)
+        arr_enc  = np.asarray(batch_enc, dtype=np.uint8)
+        arr_nlen = np.asarray(batch_nlen, dtype=np.int32)
+
+        # Variable-length columns: object arrays of 1D arrays
+        arr_off = np.asarray(batch_off, dtype=object)
+        arr_val = np.asarray(batch_val, dtype=object)
+
+        # fitsio creates a primary HDU (ext=0) immediately; the first table becomes ext=1
+        if (not table_created) and (len(fits) < 2):
+            fits.write(
+                [arr_cov, arr_enc, arr_nlen, arr_off, arr_val],
+                names=["COVPIX", "ENC", "NLEN", "OFF", "VAL"],
+                formats=["K", "B", "J", "PJ()", f"P{val_fits_type}()"],
+            )
+            # Write header keys directly
+            fits[1].write_key("NSIDE_COV", int(nside_cov))
+            fits[1].write_key("NSIDE_SPA", int(nside_spa))
+            fits[1].write_key("NFINE", int(nfine))
+            fits[1].write_key("DTYPE", "float32" if dt == np.float32 else "float64")
+            fits[1].write_key("ENCOD", "OFFVAL")
+            fits[1].write_key("SENTINEL", float(sentinel) if not np.isnan(sentinel) else np.nan)
+            table_created = True
+        else:
+            fits[1].append([arr_cov, arr_enc, arr_nlen, arr_off, arr_val])
+
+        batch_cov.clear()
+        batch_enc.clear()
+        batch_nlen.clear()
+        batch_off.clear()
+        batch_val.clear()
+
+    n = len(covpix)
+    i = 0
+    while i < n:
+        c = covpix[i]
+        j = i + 1
+        while j < n and covpix[j] == c:
+            j += 1
+
+        row_off = np.asarray(off[i:j], dtype=np.int32)
+        row_val = np.asarray(vals[i:j], dtype=dt)
+
+        # Defensive: ensure uniqueness inside the row (usually already unique)
+        if row_off.size != np.unique(row_off).size:
+            # keep last occurrence (stable)
+            rev = row_off[::-1]
+            _, idx_rev = np.unique(rev, return_index=True)
+            keep_idx = (row_off.size - 1 - idx_rev)
+            keep_idx.sort()
+            row_off = row_off[keep_idx]
+            row_val = row_val[keep_idx]
+
+        batch_cov.append(int(c))
+        batch_enc.append(1)
+        batch_nlen.append(int(row_off.size))
+        batch_off.append(row_off)
+        batch_val.append(row_val)
+
+        if len(batch_cov) >= rows_per_batch:
+            flush()
+
+        i = j
+
+    flush()
+    fits.close()
+
+
+def _read_stage_fits_offval_fast(stage_path, io_block_rows=50_000):
+    """
+    Load a SkyMaskPipe stage from an OFFVAL FITS table using fast streaming I/O.
+
+    This function reconstructs a floating-point healsparse map from a stage FITS file
+    written in **OFFVAL** encoding (offset/value variable-length columns). Data are read
+    in row blocks and written directly into the output map without constructing dense
+    HEALPix arrays.
+
+    Parameters
+    ----------
+    stage_path : str or os.PathLike
+        Path to the FITS stage file to read.
+    io_block_rows : int, default=50_000
+        Number of FITS table rows to read per block. Larger values improve throughput
+        but increase memory usage.
+
+    Returns
+    -------
+    hspmap : healsparse.HealSparseMap
+        The reconstructed floating map (float32 or float64), with geometry defined by 
+        FITS header keys.
+
+    Notes
+    -----
+    - This reader expects the FITS header to contain ``ENCOD='OFFVAL'`` and the geometry
+      keys ``NSIDE_COV``, ``NSIDE_SPA``, and ``NFINE``. The dtype is taken from ``DTYPE``
+      ('float32'/'float64') and the map sentinel is taken from ``SENTINEL`` (default 0.0).
+    - OFFVAL schema (binary table) is assumed to provide per-row:
+
+        * ``COVPIX`` : int64 coverage pixel index
+        * ``OFF``    : varlen int offsets within the coverage pixel (0..NFINE-1)
+        * ``VAL``    : varlen float values for each offset
+        * ``NLEN``   : optional int length of the true OFF/VAL payload for that row
+
+    - If the table contains an ``NLEN`` column, it is used to slice OFF/VAL arrays to
+      the true per-row length. This is the recommended and fastest path.
+    - If ``NLEN`` is missing (older files), the reader falls back to a defensive
+      de-duplication strategy to avoid crashes caused by padded junk entries in OFF/VAL.
+      In that fallback:
+
+        * If offset==0 is duplicated, the **first** occurrence is kept (to avoid padding
+          zeros overwriting a real offset-0 value).
+        * For other duplicated offsets, the **last** occurrence is kept.
+        * A final pixel-level uniqueness pass is applied before assignment, keeping the
+          last occurrence.
+
+    - The function assigns values via ``hspmap[pix] = v`` where
+      ``pix = COVPIX * NFINE + OFF`` for each row.
+    """
+    f = fitsio.FITS(stage_path, "r")
+    hdr = f[1].read_header()
+
+    enc = str(hdr.get("ENCOD", "BITPACK"))
+    if enc != "OFFVAL":
+        f.close()
+        raise ValueError(f"Expected ENCOD=OFFVAL, got {enc}")
+
+    nside_cov = int(hdr["NSIDE_COV"])
+    nside_spa = int(hdr["NSIDE_SPA"])
+    nfine = int(hdr["NFINE"])
+
+    dtype_str = str(hdr.get("DTYPE", "float32"))
+    dt = np.float32 if dtype_str == "float32" else np.float64
+
+    sentinel = hdr.get("SENTINEL", 0.0)
+    try:
+        sentinel = float(sentinel)
+    except Exception:
+        sentinel = 0.0
+
+    hspmap = hsp.HealSparseMap.make_empty(
+        nside_cov, nside_spa, dtype=dt, sentinel=sentinel, bit_packed=False
+    )
+
+    colnames = [c.upper() for c in f[1].get_colnames()]
+    has_nlen = "NLEN" in colnames
+
+    nrows = f[1].get_nrows()
+    for i0 in range(0, nrows, io_block_rows):
+        i1 = min(i0 + io_block_rows, nrows)
+        rows = np.arange(i0, i1)
+
+        cov = f[1].read_column("COVPIX", rows=rows).astype(np.int64, copy=False)
+        off = f[1].read_column("OFF", rows=rows)
+        val = f[1].read_column("VAL", rows=rows)
+
+        if has_nlen:
+            nlen = f[1].read_column("NLEN", rows=rows).astype(np.int64, copy=False)
+        else:
+            nlen = None
+
+        if has_nlen:
+            for c, n, o, v in zip(cov, nlen, off, val):
+                if n == 0 or o is None or v is None:
+                    continue
+                o = np.asarray(o, dtype=np.int64)[:n]
+                v = np.asarray(v, dtype=dt)[:n]
+                if o.size == 0:
+                    continue
+                pix = c * nfine + o
+                hspmap[pix] = v
+        else:
+            # Fallback for older OFFVAL files without NLEN
+            for c, o, v in zip(cov, off, val):
+                if o is None or v is None or len(o) == 0:
+                    continue
+                o = np.asarray(o, dtype=np.int64)
+                v = np.asarray(v, dtype=dt)
+
+                # If padded junk exists, duplicates will appear (often offset 0 repeated).
+                # We enforce uniqueness inside this row before assignment.
+                if o.size != np.unique(o).size:
+                    # choose per-unique offset:
+                    # - if offset==0 duplicated: keep FIRST (avoid padding overwriting true offset 0)
+                    # - otherwise: keep LAST
+                    # (row lengths are small; a small loop is fine)
+                    keep_indices = []
+                    seen = {}
+                    for idx, offv in enumerate(o):
+                        # record first occurrence
+                        if offv not in seen:
+                            seen[offv] = idx
+                        # always update "last"
+                        seen[(offv, "last")] = idx
+
+                    uniq = np.unique(o)
+                    for offv in uniq:
+                        if offv == 0:
+                            keep_indices.append(seen[0])  # first
+                        else:
+                            keep_indices.append(seen[(offv, "last")])  # last
+
+                    keep_indices = np.asarray(sorted(set(keep_indices)), dtype=np.int64)
+                    o = o[keep_indices]
+                    v = v[keep_indices]
+
+                pix = c * nfine + o
+                # last safety: healsparse requires unique pix
+                if pix.size != np.unique(pix).size:
+                    # keep last
+                    rev = pix[::-1]
+                    _, idx_rev = np.unique(rev, return_index=True)
+                    keep = (pix.size - 1 - idx_rev)
+                    keep.sort()
+                    pix = pix[keep]
+                    v = v[keep]
+
+                hspmap[pix] = v
+
+    f.close()
+    return hspmap
+
 
 def getarea_moc(moc: "MOC") -> float:
     """
@@ -561,6 +926,117 @@ def split_moc_into_chunks(moc: MOC,
     return out
 
 
+
+
+@dataclass(frozen=True)
+class ProfileLibrary:
+    """
+    Selection + interpolation for tabulated profiles.
+
+    profiles[band][mag_bin] = (r_arcsec, p)
+    """
+    profiles: Dict[str, Dict[Any, Tuple[np.ndarray, np.ndarray]]]
+    mag_bins: Sequence[Any]
+    use_pchip: bool = True
+
+    def __post_init__(self):
+        use_pchip = bool(self.use_pchip) and _HAS_PCHIP
+        p_of_r = {}
+
+        for band, by_bin in self.profiles.items():
+            p_of_r[band] = {}
+            for mag_bin, (r, p) in by_bin.items():
+                r = np.asarray(r, dtype=float).ravel()
+                p = np.asarray(p, dtype=float).ravel()
+                if r.size != p.size or r.size < 2:
+                    raise ValueError(f"Bad profile arrays for band={band!r}, bin={mag_bin!r}")
+
+                o = np.argsort(r)
+                r, p = r[o], p[o]
+                keep = np.concatenate(([True], np.diff(r) > 0))
+                r, p = r[keep], p[keep]
+                p_m = _monotonicize_increasing(p)
+
+                if use_pchip and r.size >= 3:
+                    p_of_r[band][mag_bin] = PchipInterpolator(r, p_m, extrapolate=True)
+                else:
+                    r0, p0 = r.copy(), p_m.copy()
+
+                    def _lin(rr, r0=r0, p0=p0):
+                        rr = np.asarray(rr, dtype=float)
+                        return np.interp(rr, r0, p0, left=p0[0], right=p0[-1])
+
+                    p_of_r[band][mag_bin] = _lin
+
+        object.__setattr__(self, "_p_of_r", p_of_r)
+        object.__setattr__(self, "_bin_mode_interval", self._detect_interval_bins())
+
+    def _detect_interval_bins(self) -> bool:
+        try:
+            mb0 = self.mag_bins[0]
+        except Exception:
+            return False
+        return isinstance(mb0, (tuple, list)) and len(mb0) == 2
+
+    def pick_mag_bin(self, G: float):
+        if self._bin_mode_interval:
+            for mb in self.mag_bins:
+                g0, g1 = mb
+                if G >= g0 and G < g1:
+                    return mb
+            if G < self.mag_bins[0][0]:
+                return self.mag_bins[0]
+            return self.mag_bins[-1]
+
+        vals = np.asarray(self.mag_bins, dtype=float)
+        j = int(np.argmin(np.abs(vals - float(G))))
+        return self.mag_bins[j]
+
+    def p_of_r(self, r_arcsec: np.ndarray, *, band: str, mag_bin: Any) -> np.ndarray:
+        return np.asarray(self._p_of_r[band][mag_bin](r_arcsec), dtype=float)
+
+    def radii_for_levels(
+        self, *, band: str, mag_bin: Any, p_floor_level: float, p_comp_level: float
+    ) -> Tuple[float, float]:
+        r, p = self.profiles[band][mag_bin]
+        r_in = invert_radius_at_level(r, p, p_floor_level)
+        r_out = invert_radius_at_level(r, p, p_comp_level)
+        if not np.isfinite(r_in) or not np.isfinite(r_out):
+            return float("nan"), float("nan")
+        if r_out < r_in:
+            r_out = r_in
+        return float(r_in), float(r_out)
+
+
+def build_radial_model(
+    *,
+    profiles: Dict[str, Dict[Any, Tuple[np.ndarray, np.ndarray]]],
+    mag_bins: Sequence[Any],
+    band: str,
+    p_floor_level: float = 0.20,
+    p_comp_level: float = 0.85,
+    w_cap: Optional[float] = None,
+    use_pchip: bool = True,
+    dr_factor: float = 1.0,
+    weight_quant: float = 1e-3,
+) -> dict:
+    """
+    Build a model dict for build_star_weightmask_online().
+    """
+    lib = ProfileLibrary(profiles=profiles, mag_bins=mag_bins, use_pchip=use_pchip)
+    return dict(
+        mode="profile_arcsec_v2",
+        library=lib,
+        band=str(band),
+        p_floor_level=float(p_floor_level),
+        p_comp_level=float(p_comp_level),
+        w_cap=None if w_cap is None else float(w_cap),
+        dr_factor=float(dr_factor),
+        weight_quant=float(weight_quant),
+    )
+
+
+
 #####################################################################
 ########################  CLASS DEFINITION  #########################
 #####################################################################
@@ -727,62 +1203,105 @@ class SkyMaskPipe:
         return m.get("order_sparse"), m.get("order_coverage")
 
 
-    def write(self, outdir: str | os.PathLike, overwrite: bool = True,
-              rows_per_batch: int = 8192) -> None:
+    def write(self, outdir: str | os.PathLike, overwrite: bool = True, rows_per_batch: int = 8192, 
+              float_sentinel: float = 0.0) -> None:
         """
-        Save a SkyMaskPipe instance to disk. The output is a directoy containing one FITS
-        file per stage (with per-row Bitpack encoding), which hold the corresponding valid pixels.
-        It also ouputs a JSON file for metadada comprising scalars, parameter dictionaries,
-        and stage filenames.
-
+        Save a SkyMaskPipe instance to disk. The output is a directoy containing one FITS 
+        file per stage. Boolean stages are stored with per-row BITPACK encoding. Floating stages 
+        (float32/float64) are stored with per-row OFFVAL encoding. It also outputs a JSON file for
+        metadata, comprising scalar values, parameter dictionaries, and stage filename encodings.
+    
         Parameters
         ----------
         outdir : str or os.PathLike
             Destination directory where the pipeline will be saved.
         overwrite : bool, default=True
-            If True, replaces any existing directory at `outdir`. If False and the
-            directory exists, raises a `FileExistsError`.
+            If True, replaces any existing directory at `outdir`. If False and the directory 
+            exists, raises a `FileExistsError`
         rows_per_batch : int, default=8192
             Number of rows to write per batch when streaming stage FITS files.
+        float_sentinel : float, default=0.0
+            Sentinel value for floating masks (pixels equal to sentinel are not written). A value of 
+            0.0 is recommended for weight-like masks to keep I/O sparse and easy to use
         """
         outdir = Path(outdir)
         tmpdir = Path(tempfile.mkdtemp(prefix="skymaskpipe_write_", dir=outdir.parent))
-
         try:
             tmpdir.mkdir(exist_ok=True, parents=True)
-
+    
             # ---- metadata skeleton
             meta = {
                 "format": "skymaskpipe-bitpack-fits-stream",
                 "version": getattr(self, "_BITPACK_FITS_VERSION", 1),
                 "class": self.__class__.__name__,
-                "stages": {},     # name -> {filename: ...}
-                "scalars": {},    # from _SCALAR_ATTRS if present
-                "params": {},     # JSON-safe _params
+                "stages": {},   # name -> {filename: ...}
+                "scalars": {},  # from _SCALAR_ATTRS if present
+                "params": {},   # JSON-safe _params
             }
-
+    
             # ---- scalars: use your existing list, independent of __str__()
             if hasattr(self, "_SCALAR_ATTRS"):
                 for k in self._SCALAR_ATTRS:
                     if hasattr(self, k):
                         meta["scalars"][k] = getattr(self, k)
-
+    
             # ---- discover stages (NO fallback to _STAGE_ATTRS)
             discovered = list(self._discover_stage_items())
             if not discovered:
                 raise RuntimeError("No stages present to write.")
-
-            # ---- write each stage as FITS (bit-packed streaming)
+    
+            # ---- write each stage as FITS (bit-packed streaming OR OFFVAL for floats)
             wrote = 0
+            wrote_any_float = False
+    
             for name, hspmap in discovered:
                 fn = f"{name}.fits"
-                _write_stage_fits_bitpack(tmpdir / fn, hspmap, rows_per_batch=rows_per_batch)
-                meta["stages"][name] = {"filename": fn}
-                wrote += 1
-
+                stage_path = tmpdir / fn
+    
+                dt = np.dtype(getattr(hspmap, "dtype", None))
+    
+                # Existing behavior: bool -> BITPACK
+                if np.issubdtype(dt, np.bool_):
+                    _write_stage_fits_bitpack(stage_path, hspmap, rows_per_batch=rows_per_batch)
+                    meta["stages"][name] = {
+                        "filename": fn,
+                        "encod": "BITPACK",
+                        "dtype": "bool",
+                    }
+                    wrote += 1
+                    continue
+    
+                # New: float -> OFFVAL
+                if dt in (np.float32, np.float64):
+                    # You must implement this function (mirrors BITPACK writer style)
+                    _write_stage_fits_offval(
+                        stage_path,
+                        hspmap,
+                        rows_per_batch=rows_per_batch,
+                        sentinel=float_sentinel,
+                    )
+                    meta["stages"][name] = {
+                        "filename": fn,
+                        "encod": "OFFVAL",
+                        "dtype": "float32" if dt == np.float32 else "float64",
+                        "sentinel": float(float_sentinel),
+                    }
+                    wrote_any_float = True
+                    wrote += 1
+                    continue
+    
+                raise TypeError(
+                    f"Stage {name!r} has unsupported dtype={dt!r}. "
+                    "Supported dtypes: bool, float32, float64."
+                )
+    
             if wrote == 0:
                 raise RuntimeError("No stages present to write.")
-
+    
+            # If we wrote floats, bump the version (keeps backward compatibility for old files)
+            if wrote_any_float and meta["version"] < 2:
+                meta["version"] = 2
+    
             # ---- JSON-safe copy of _params
             def _to_jsonable(x):
                 import numpy as _np
@@ -800,26 +1319,26 @@ class SkyMaskPipe:
                 if isinstance(x, _Path):
                     return str(x)
                 return str(x)
-
+    
             if getattr(self, "_params", None):
                 meta["params"] = _to_jsonable(self._params)
-
+    
             # ---- write metadata.json
             with open(tmpdir / "metadata.json", "w", encoding="utf-8") as f:
                 json.dump(meta, f, indent=2, sort_keys=True)
-
+    
             # ---- move into place atomically-ish
             if outdir.exists():
                 if not overwrite:
                     raise FileExistsError(f"{outdir} exists and overwrite=False")
                 shutil.rmtree(outdir)
             shutil.move(str(tmpdir), str(outdir))
-
+    
         finally:
             # best-effort cleanup if tmpdir still around (e.g., move failed)
             if tmpdir.exists() and tmpdir.parent != outdir:
                 shutil.rmtree(tmpdir, ignore_errors=True)
-
+        
 
     @staticmethod
     def _band_polygon_lb(b0_deg: float, n_long_samples: int = 720) -> SkyCoord:
@@ -1432,7 +1951,7 @@ class SkyMaskPipe:
             The star mask as a `HealSparseMap`, also stored as `self.starmask` when `output_stage` is None
         """
         # from lsdb.core.search.moc_search import MOCSearch   # this was for lsdb 0.6.4
-        from lsdb.core.search.region_search import MOCSearch  # important import!
+        #from lsdb.core.search.region_search import MOCSearch  # important import!
 
         print('BUILDING STAR MASK >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
         if not(isinstance(starq, dict)): raise Exception("starq must be a valid dictionary")
@@ -2154,7 +2673,7 @@ class SkyMaskPipe:
     def apply(self, stage : str ='mask', cat: Union[pd.DataFrame, Table, None] = None, 
               columns: Sequence[str] = ("ra", "dec"), file: Optional[str] = None) -> Union[pd.DataFrame, Table]:
         """
-        Apply a mask to a catalog (DataFrame/Astropy_Table) and optionally save it to disk.
+        Apply a boolean mask to a catalog (DataFrame/Astropy_Table) and optionally save it to disk.
 
         Parameters
         ----------
@@ -2189,7 +2708,7 @@ class SkyMaskPipe:
 
 
     @classmethod
-    def read(cls, indir: str | os.PathLike, *, max_workers: int | None = None,
+    def read_old(cls, indir: str | os.PathLike, *, max_workers: int | None = None,
              io_block_rows: int = 200_000, per_worker_buffer_cap: int = 12_000_000,
              verbose: bool = True):
         """
@@ -2303,6 +2822,143 @@ class SkyMaskPipe:
         return self
 
 
+    @classmethod
+    def read(
+        cls,
+        indir: str | os.PathLike,
+        *,
+        max_workers: int | None = None,
+        io_block_rows: int = 200_000,
+        per_worker_buffer_cap: int = 12_000_000,
+        verbose: bool = True):
+        """
+        Read a SkyMaskPipe instance from disk.
+    
+        Supports:
+          - BITPACK boolean stages (existing format)
+          - OFFVAL float stages (new format)
+    
+        The input is a directory containing a JSON file for metadata and a series of FITS
+        files, one per stage. Read is performed in parallel across stages using ThreadPool workers.
+        """
+        indir = Path(indir)
+        meta = json.loads((indir / "metadata.json").read_text(encoding="utf-8"))
+    
+        self = cls.__new__(cls)
+    
+        # ---- restore scalars
+        for k, v in meta.get("scalars", {}).items():
+            setattr(self, k, v)
+    
+        # ---- stages listed in metadata
+        stages_meta = list(meta.get("stages", {}).items())  # [(name, info), ...]
+    
+        # default workers: half CPUs, capped by number of stages (>=1)
+        if max_workers is None:
+            ncpu = os.cpu_count() or 2
+            max_workers = max(1, min(len(stages_meta) or 1, max(1, ncpu // 2)))
+    
+        print_lock = threading.Lock()
+    
+        def _infer_encod_from_fits(fpath: Path) -> str:
+            # Backward-compat inference when encod not in metadata
+            with fitsio.FITS(str(fpath), mode="r") as f:
+                hdr = f[1].read_header()
+            return str(hdr.get("ENCOD", "BITPACK")).upper()
+    
+        def _load_one(stage_name, info):
+            # info can be dict (new/old) or string (very old)
+            if isinstance(info, dict):
+                filename = info.get("filename")
+                encod = info.get("encod", None)
+            else:
+                filename = str(info)
+                encod = None
+    
+            if filename is None:
+                raise ValueError(f"[read] Stage {stage_name} metadata missing 'filename'.")
+    
+            fpath = indir / filename
+    
+            if encod is None:
+                encod = _infer_encod_from_fits(fpath)
+            else:
+                encod = str(encod).upper()
+    
+            if verbose:
+                with print_lock:
+                    print(f"[read] Loading {stage_name} <- {filename} ({encod})", flush=True)
+    
+            # ---- dispatch by encoding
+            if encod == "BITPACK":
+                hspmap = _read_stage_fits_bitpack_fast(
+                    fpath,
+                    io_block_rows=io_block_rows,
+                    per_worker_buffer_cap=per_worker_buffer_cap,
+                    verbose=False,          # let this method handle user-facing prints
+                    print_lock=print_lock,  # still pass lock in case the loader uses it
+                    stage_name=stage_name,
+                )
+            elif encod == "OFFVAL":
+                # New float reader you added
+                hspmap = _read_stage_fits_offval_fast(
+                    fpath,
+                    io_block_rows=io_block_rows,
+                )
+            else:
+                raise ValueError(f"[read] Unknown stage encoding {encod!r} for {stage_name} ({filename}).")
+    
+            if verbose:
+                nside_cov = getattr(hspmap, "nside_coverage", "?")
+                nside_sparse = getattr(hspmap, "nside_sparse", "?")
+                n_valid = getattr(hspmap, "n_valid", "?")
+                with print_lock:
+                    print(
+                        f"[read] Done {stage_name} (nside_cov={nside_cov}, "
+                        f"nside_sparse={nside_sparse}, n_valid={n_valid})",
+                        flush=True,
+                    )
+    
+            return stage_name, hspmap
+    
+        # ---- load in parallel
+        results = {}
+        if stages_meta:
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futs = [ex.submit(_load_one, nm, info) for nm, info in stages_meta]
+                for fut in as_completed(futs):
+                    nm, hspmap = fut.result()
+                    results[nm] = hspmap
+    
+        # ---- attach each loaded stage (supports custom names)
+        for nm, m in results.items():
+            setattr(self, nm, m)
+    
+        # ---- infer geometry from first stage if missing
+        first = next(iter(results.values()), None)
+        if first is not None:
+            def _order(nside: int) -> int:
+                return int(round(math.log2(max(1, nside))))
+    
+            if not hasattr(self, "nside_cov"):
+                self.nside_cov = int(first.nside_coverage)
+            if not hasattr(self, "nside_out"):
+                self.nside_out = int(first.nside_sparse)
+            if not hasattr(self, "order_cov"):
+                self.order_cov = _order(self.nside_cov)
+            if not hasattr(self, "order_out"):
+                self.order_out = _order(self.nside_out)
+    
+        # ---- restore _params
+        self._params = dict(meta.get("params", {}))
+    
+        if verbose:
+            with print_lock:
+                print("[read] All stages attached.", flush=True)
+    
+        return self
+    
+    
     @staticmethod
     def read_single(fpath, *, io_block_rows: int = 200_000, per_worker_buffer_cap: int = 12_000_000,
         verbose: bool = True, stage_name: str | None = None, print_lock=None):
@@ -2502,6 +3158,7 @@ class SkyMaskPipe:
                  clipdec: Optional[tuple[float, float]] = None, order_force: Optional[int] = None,
                  frame: str = "icrs", projection: str = "SIN", figsize: tuple[float, float] = (10.0, 5.0),
                  color: str = "green", alpha: float = 0.2, linewidth: float = 1.0, label: Optional[str] = None,
+                 fill: bool = True,
                  ax: Optional[Axes] = None, wcs: Optional[WCS] = None, show: bool = False, 
                  stream_pars: Optional[dict[str, object]] = None) -> tuple[Figure, Axes, WCS]:
         """
@@ -2530,6 +3187,8 @@ class SkyMaskPipe:
             Figure size
         color, alpha, linewidth : matplotlib color, flot, float
             Color, transparency, border linewidth
+        fill : bool
+            Plot the pixels as shaded patches.
         ax, wcs : axes type, wcs type
             Axes and WCS objects. Pass these from a previous call to layer plots
         show : bool
@@ -2604,7 +3263,7 @@ class SkyMaskPipe:
         # Draw the MOC on the provided/created axes & wcs. Beware we set optimize=False because
         # the moc is already the right (possibly degraded) order
         print('Drawing plot...')
-        moc.fill(ax=ax, wcs=wcs, alpha=alpha, fill=True, color=color, zorder=1, label=label, optimize=False)
+        moc.fill(ax=ax, wcs=wcs, alpha=alpha, fill=fill, color=color, zorder=1, label=label, optimize=False)
         moc.border(ax=ax, wcs=wcs, alpha=max(0.6, alpha), color='k',
                    linewidth=linewidth, zorder=2)
 
@@ -2767,7 +3426,7 @@ class SkyMaskPipe:
     ):
         """
         Render a **fractional area map** for a pipeline stage or healsparse map and display it on WCS axes,
-        optionally overlaying one or more isocontours. Works in two modes:
+        optionally overlaying one or more isocontours.
         
         Parameters
         ----------
@@ -2834,10 +3493,7 @@ class SkyMaskPipe:
         """
         
         # Choose stage based on input healsparse map or the name of stage in a pipeline
-        if hasattr(stage, 'valid_pixels'):
-            stage = stage
-        else:
-            stage = getattr(self, stage)
+        if not hasattr(stage, "valid_pixels"): stage = getattr(self, stage)
 
         # Create fractional area map for input stage
         frac_map = SkyMaskPipe.frac_area_map(stage, order_frac=order_frac, avg_edges=avg_edges)
@@ -2929,8 +3585,253 @@ class SkyMaskPipe:
         # Return everything in case the user need to keep plotting
         return fig, ax, wcs, im, CS
 
+
+    def _sample_healsparse_on_wcs(stage, wcs, nx, ny, *, nest=True, row_block=256):
+        """
+        Nearest-neighbor sample a HealSparseMap onto a target WCS grid.
+        Returns (ny, nx) float array with NaN where invalid.
+        """
+        from astropy.wcs.utils import pixel_to_skycoord
+
+        out = np.full((ny, nx), np.nan, dtype=np.float32)
+    
+        nside = stage.nside_sparse
+        xs = np.arange(nx, dtype=np.float32)
+    
+        for y0 in range(0, ny, row_block):
+            y1 = min(ny, y0 + row_block)
+    
+            # Build pixel grid for this strip
+            yy = np.arange(y0, y1, dtype=np.float32)[:, None]    # (B, 1)
+            xx = xs[None, :]                                     # (1, nx)
+    
+            # Pixel -> Sky (vectorized)
+            sc = pixel_to_skycoord(xx, yy, wcs, origin=0)        # SkyCoord (B, nx)
+    
+            # Sky -> HEALPix
+            lon = sc.ra.deg
+            lat = sc.dec.deg
+    
+            good = np.isfinite(lon) & np.isfinite(lat)
+    
+            if np.any(good):
+                theta = np.deg2rad(90.0 - lat[good])
+                phi   = np.deg2rad(lon[good])
+                ipix  = hp.ang2pix(nside, theta, phi, nest=nest)
+    
+                # Query healsparse only where needed
+                vals = stage.get_values_pix(ipix).astype(np.float32, copy=False)
+    
+                # If your float mask uses hp.UNSEEN for empty, map to NaN
+                # (if not, remove this)
+                vals = np.where(vals == hp.UNSEEN, np.nan, vals)
+    
+                block = out[y0:y1]
+                block[good] = vals
+    
+        return out
+    
+
+    def plot_floatmap(self, stage: Union[HealSparseMap, str], ax=None, wcs=None,
+        center: SkyCoord | None = None, fov: Angle | None = None,
+        frame: str = "icrs", projection: str = "SIN", figsize: tuple[float, float] = (10., 5.),
+        vmin: float = 0., vmax: float = 1., cmap: str | None = None,
+        thresholds: float | Sequence[float] | None = None,
+        contour_smooth: dict | None = None, contour_kwargs: dict | None = None,
+        contour_label: bool | str = False, contour_label_kwargs: dict | None = None,
+        alpha: float = 1., zorder_img: float = 1.0, zorder_contour: float = 2., colorbar: bool = True):
+        """
+        Render a floating mask stage as an image and project into a WCS axes.
+    
+        This method samples the map directly onto the current WCS pixel grid using
+        nearest-neighbor HEALPix lookup, and then renders it with `matplotlib.imshow`.
+        Only the pixels needed for the current WCS viewport are evaluated. A colorbar 
+        can be added, and optional contour overlays can be drawn from the sampled image.
+    
+        Two usage patterns are supported:
+    
+        - **Provide `center` and `fov`**: a new WCSAxes is created internally using the
+          requested `frame` and `projection`.
+        - **Provide `ax` and `wcs`**: the stage is rendered into an existing WCSAxes.
+    
+        Parameters
+        ----------
+        stage : healsparse.HealSparseMap or str
+            The floating stage to plot. If a string is given, it is interpreted as the
+            name of an attribute in the pipeline (e.g. ``"starweight_mask"``).
+        ax : matplotlib.axes.Axes, optional
+            Target axes (must be a WCSAxes compatible with the provided `wcs`). If not
+            provided, a new figure/axes is created (requires `center` and `fov`).
+        wcs : astropy.wcs.WCS, optional
+            WCS associated with `ax`. If not provided, a WCS is constructed internally
+            (requires `center` and `fov`).
+        center : astropy.coordinates.SkyCoord, optional
+            Center of the view. Required when `ax`/`wcs` are not provided.
+        fov : astropy.coordinates.Angle, optional
+            Field of view (typically the width of the view). Required when `ax`/`wcs`
+            are not provided.
+        frame : str, default="icrs"
+            Coordinate frame for the constructed WCS when creating a new context.
+        projection : str, default="SIN"
+            Sky projection code passed to the WCS constructor when creating a new context.
+        figsize : tuple, default=(10., 5.)
+            Figure size used when creating a new context.
+        vmin, vmax : float, default=(0., 1.)
+            Lower/upper limits passed to `imshow`.
+        cmap : str, optional
+            Matplotlib colormap name. If None, Matplotlib defaults are used.
+        thresholds : float or sequence of float, optional
+            If provided, draw contour lines at these level(s) using the sampled WCS image.
+            A scalar is interpreted as a single level; a sequence draws multiple levels.
+        contour_smooth : dict, optional
+            Optional (gaussian) smoothing applied *only* to the contour field (not the displayed image).
+            Supported keys: (1) ``method`` : {None, "gaussian"} (default None), and 
+            (2) ``sigma_pix`` : float, Gaussian sigma in image pixels (default 1.5)
+        contour_kwargs : dict, optional
+            Extra keyword arguments forwarded to `ax.contour` (e.g. linewidths, colors).
+        contour_label : bool or str, default=False
+            If True, label contour levels. If a string, it is used as a format template
+            with ``{level}`` available (e.g. ``"w={level:.2f}"``). If True, a default
+            format ``"f={level:.2f}"`` is used.
+        contour_label_kwargs : dict, optional
+            Extra keyword arguments forwarded to `ax.clabel` (e.g. fontsize, inline).
+        alpha : float, default=1.0
+            Alpha transparency for the image layer.
+        zorder_img : float, default=1.0
+            Z-order for the image layer.
+        zorder_contour : float, default=2.0
+            Z-order for the contour overlay.
+        colorbar : bool, default=True
+            If True, attach a colorbar to the axes.
+    
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            The figure containing the plot.
+        ax : matplotlib.axes.Axes
+            The WCS axes used for the plot.
+        wcs : astropy.wcs.WCS
+            The WCS object used for sampling and plotting.
+        im : matplotlib.image.AxesImage
+            The `imshow` image artist.
+    
+        Notes
+        -----
+        - If both `ax` and `wcs` are provided, no new figure context is created and
+          `fig = ax.figure` is returned.
+    
+        Examples
+        --------
+        Create a new WCS view and plot a weight mask:
+    
+        >>> fig, ax, wcs, im = mkp.plot_floatmap(
+        ...     "starweight_mask",
+        ...     center=SkyCoord(150.0, 2.2, unit="deg"),
+        ...     fov=Angle(10.0, "deg"),
+        ...     vmin=1.0, vmax=4.0,
+        ...     thresholds=[1.2, 1.5, 2.0],
+        ...     contour_smooth={"method": "gaussian", "sigma_pix": 2.0},
+        ... )
+    
+        Plot into an existing WCSAxes:
+    
+        >>> fig, ax, wcs, im = mkp.plot_floatmap(mkp.starweight_mask, ax=ax, wcs=ax.wcs)
+        """
+        # Choose stage based on input healsparse map or the name of stage in a pipeline
+        if not hasattr(stage, "valid_pixels"): stage = getattr(self, stage)
+    
+        # Create axes/wcs or take from the input keyworks ------------------------
+        created_context = False
+        if (ax is None) or (wcs is None):
+            if center is None or fov is None:
+                raise ValueError("When ax/wcs are not provided, you must pass `center` and `fov`.")
+            fig = plt.figure(figsize=figsize)
+            with WCS(fig, fov=fov, center=center, coordsys=frame,
+                     projection=projection, rotation=Angle(0, u.deg)) as _wcs:
+                ax = fig.add_subplot(1, 1, 1, projection=_wcs)
+                lon = ax.coords['ra']; lat = ax.coords['dec']
+                lon.set_format_unit(u.deg, decimal=True, show_decimal_unit=True)
+                lat.set_format_unit(u.deg, decimal=True, show_decimal_unit=True)
+                ax.set_xlabel("ra"); ax.set_ylabel("dec")
+                ax.grid(color="black", linestyle="dotted")
+                wcs = _wcs
+                created_context = True
+        else:
+            fig = ax.figure
+    
+        # Get the header from mocpy WCS and compute nx,ny from CRPIX1&2 -----------
+        hdr = wcs.to_header()
+        nx = int(round(2.0 * float(hdr["CRPIX1"])))
+        ny = int(round(2.0 * float(hdr["CRPIX2"])))
+    
+        # Alternative 1: sample the map directly in the WCS using nearest-neigh interp. Very fast.
+        # Drawback is that only the visible portion is created and zooming wont reveal more details
+        arr = SkyMaskPipe._sample_healsparse_on_wcs(stage, ax.wcs, nx, ny, nest=True, row_block=256)
+        im = ax.imshow(arr, origin="lower", vmin=vmin, vmax=vmax, cmap=cmap,
+                       alpha=alpha, zorder=zorder_img)
+        # Alternative 2: reproject. This creates full 2*ndside^2 pixel images, so its not feasible 
+        # for highres. Advantage is that zooming will reveal more detail. Here order="nearest-neighbor"
+        #vals = stage.generate_healpix_map(nside=stage.nside_sparse, nest=True).astype(float)
+        #vals[vals == hp.UNSEEN] = np.nan
+        #arr, _ = reproject_from_healpix((vals, "icrs"), ax.wcs, shape_out=(ny, nx), 
+        #                                nested=True, order=order)
+        #im = ax.imshow(arr, origin="lower", vmin=vmin, vmax=vmax, cmap=cmap,
+        #               alpha=alpha, zorder=zorder_img)
+
+
+        # Draw contours  ----------------------------------------------------------
+        CS = None
+        if thresholds is not None:
+            if np.isscalar(thresholds):
+                levels = [float(thresholds)]
+            else:
+                levels = [float(t) for t in thresholds]
+            levels = sorted({t for t in levels if np.isfinite(t)})
+    
+            ck = dict(zorder=zorder_contour)
+            if contour_kwargs:
+                ck.update(contour_kwargs)
+    
+            arr_for = np.array(arr, copy=True)
+            finite = np.isfinite(arr_for)
+    
+            method = (contour_smooth or {}).get('method', None)
+            if method in (None, 'gaussian'):
+                if method == 'gaussian':
+                    wgt = finite.astype(float)
+                    a0  = np.where(finite, arr_for, 0.0)
+                    sigma_pix = float((contour_smooth or {}).get('sigma_pix', 1.5))
+                    num = gaussian_filter(a0,  sigma=sigma_pix, mode='nearest')
+                    den = gaussian_filter(wgt, sigma=sigma_pix, mode='nearest')
+                    arr_for = np.where(den > 0, num/den, np.nan)
+    
+                masked = np.ma.array(arr_for, mask=~finite)
+                CS = ax.contour(masked, levels=levels, **ck)
+    
+                if contour_label:
+                    fmt = contour_label if isinstance(contour_label, str) else 'f={level:.2f}'
+                    fmt_map = {lvl: fmt.format(level=lvl) for lvl in levels}
+                    lbl_kwargs = dict(inline=True, inline_spacing=10, fmt=fmt_map, fontsize=9)
+                    if contour_label_kwargs: lbl_kwargs.update(contour_label_kwargs)
+                    texts = ax.clabel(CS, CS.levels, **lbl_kwargs)
+                    try:
+                        import matplotlib.patheffects as pe
+                        for t in texts:
+                            t.set_path_effects([pe.withStroke(linewidth=1.5, foreground='black')])
+                    except Exception:
+                        pass
+            else:
+                raise ValueError(f"Unknown contour_smooth method: {method!r}")
+
+        
+        if colorbar:
+            cb = plt.colorbar(im, ax=ax, pad=0.02)
+            cb.set_label("value")
+    
+        return fig, ax, wcs, im
         
 
+        
     @staticmethod
     def add_moca(alwidget, stage: Union[HealSparseMap, str], color: str = "red", opacity: float = 0.25,
                  rows_per_batch: int = 2048, order_forced: Optional[int] = None) -> None:
@@ -3125,82 +4026,667 @@ class SkyMaskPipe:
         return "<map>", m
 
 
-    def _empty_like_geometry(self, *, nside_cov, nside_sparse, bit_packed: bool):
-        """Auxiliary method to create an empty healsparse map"""
-        return hsp.HealSparseMap.make_empty(
-            nside_coverage=int(nside_cov), nside_sparse=int(nside_sparse),
-            dtype=np.bool_, bit_packed=bool(bit_packed) )
-
-
-    def combine(self, positive, *, negative=None, order_out: Optional[int] = None,
-                order_cov: Optional[int] = None, bit_packed: bool = True, verbose: bool = True, 
-                output_stage: Optional[str] = None):
-        """
-        Combine multiple stage masks into a single mask using logical operations.
-
-        This method supports complex boolean combinations of stage masks. The inputs in
-        `positive` are grouped into OR or AND operations, while the masks in `negative`
-        are subtracted at the pixel level. Coverage is handled row-by-row for efficiency,
-        and input maps are automatically aligned to the requested coverage order and
-        sparse order.
-
-        Parameters
-        ----------
-        positive : list
-            List of stage names or `HealSparseMap` objects to combine positively.
-            - A string corresponds to a single stage mask.
-            - A tuple or list groups multiple stages into a logical AND,
-              before OR-ing with other groups.
-        negative : list, optional
-            List of stage names or `HealSparseMap` objects to subtract from
-            the positives.
-        order_out : int
-            Order of the sparse (output) resolution.
-        order_cov : int
-            Order of the coverage resolution.
-        bit_packed : bool, default=True
-            If True, the resulting map is stored in bit-packed format. If
-            False, it remains boolean.
-        verbose : bool, default=True
-            If True, prints progress messages about coverage alignment,
-            stage orders, and final statistics.
-        output_stage : str, optional
-            Name for the ouput stage. If None, defaults to then canonical name 'mask'
-            
-        Returns
-        -------
-        mask : healsparse.HealSparseMap
-            The combined mask as a `HealSparseMap` object. Stored in
-            `self.mask`, with metadata attributes updated.
+    def _empty_like_geometry(self, *, nside_cov, nside_sparse, bit_packed: bool,
+                             dtype=np.bool_, sentinel=None):
+        """Auxiliary method to create an empty HealSparse map with a given geometry.
 
         Notes
         -----
-        - Positives are processed row-by-row at a "work order" defined as the
-          minimum of `order_out` and all positive stage orders. They are then
-          expanded to the target order.
-        - Negatives are converted per coverage row to the target order and
-          subtracted before writing to the output map.
-        - AND-groups within `positive` are intersected per row before being
-          OR-ed with other groups.
-        - Coverage mismatches across stages are resolved automatically using
-          `change_cov_order`.
+        - For boolean maps, `bit_packed` is honored.
+        - For floating maps, HealSparse currently does not support bit-packing; `bit_packed`
+          is ignored and `sentinel` is passed through.
+        """
+        dt = np.dtype(dtype)
+        if np.issubdtype(dt, np.bool_):
+            return hsp.HealSparseMap.make_empty(
+                nside_coverage=int(nside_cov),
+                nside_sparse=int(nside_sparse),
+                dtype=np.bool_,
+                bit_packed=bool(bit_packed),
+            )
+        if dt in (np.float32, np.float64):
+            if sentinel is None:
+                sentinel = 0.0
+            return hsp.HealSparseMap.make_empty(
+                nside_coverage=int(nside_cov),
+                nside_sparse=int(nside_sparse),
+                dtype=dt,
+                sentinel=sentinel,
+                bit_packed=False,
+            )
+        raise TypeError(f"Unsupported dtype for empty map: {dt!r}")
 
+
+    def _is_float_map(self, m) -> bool:
+        try:
+            dt = np.dtype(getattr(m, "dtype", None))
+        except Exception:
+            return False
+        return dt in (np.float32, np.float64)
+
+
+    def _float_sentinel(self, m, default: float = 0.0) -> float:
+        # Healsparse stores sentinel in .sentinel for float maps
+        s = getattr(m, "sentinel", default)
+        try:
+            return float(s)
+        except Exception:
+            return float(default)
+
+
+    def _combine_floatmaps(self, positive_maps: list, *,
+        negative_maps: Optional[list] = None, operation: str | Callable = "sum",
+        order_out: Optional[int] = None, order_cov: Optional[int] = None,
+        sentinel: Optional[float] = None, ignore_sentinel: bool = True,
+        negative_mode: str = "mask", verbose: bool = True):
+        """
+        Combine floating-point stage maps in a streaming, coverage-row-wise way.
+    
+        This helper implements the float backend used by `combine()` when the positive
+        inputs are floating-point maps. It avoids constructing full dense arrays at 
+        the target sparse order by streaming over coverage pixels and reducing only the 
+        union of pixels that are present in the inputs. The procedure is:
+    
+        (1) Align all positive/negative inputs to a common coverage order (`order_cov`).
+        (2) For each coverage pixel present in any positive map, convert each stage's
+            row of pixels to target-order offsets (expanding or degrading orders per row).
+        (3) Build the union of offsets across positive maps for this row and apply the
+            reducer (`operation`) to produce output values.
+        (4) Optionally apply negatives as a mask (`negative_mode="mask"`), removing
+            any union offsets hit by any negative stage for the same coverage row.
+        (5) Optionally drop sentinel-valued outputs to keep the output sparse, and
+            write the remaining pixels into the output float map.
+    
+        Parameters
+        ----------
+        positive_maps : list
+            List of floating-point input healspase maps (float32/float64).
+        negative_maps : list, optional
+            List of maps (float or bool) used to mask out pixels from the output,
+            depending on `negative_mode`.
+        operation : str or callable, default="sum"
+            Reducer to apply across positive maps for pixels in the union set within
+            each coverage row. Supported strings: ``"sum"``, ``"mean"``, ``"min"``, 
+            ``"max"``. If a callable is provided, it is called as ``operation(stack)`` 
+            where ``stack`` has shape ``(n_maps, n_pix)`` for the row union. Missing 
+            values are filled with NaN (if `sentinel` is NaN) or with `sentinel`. The 
+            callable must return a 1D array of length ``n_pix``.
+        order_out : int, optional
+            Target sparse order for the output. If None, defaults to `self.order_out`.
+        order_cov : int, optional
+            Target coverage order for the output. If None, defaults to `self.order_cov`.
+        sentinel : float, optional
+            Sentinel value representing missing pixels in float maps. If None, a
+            sentinel is inferred from the first positive map when available, else
+            defaults to 0.0.
+        ignore_sentinel : bool, default=True
+            If True, sentinel-valued pixels are ignored when building per-row inputs,
+            and sentinel-valued outputs are removed before writing to keep the output
+            sparse.
+        negative_mode : str, default="mask"
+            How negatives are applied. In ``"mask"`` mode, any pixel present in any
+            negative map is removed from the float output (not written / set to sentinel).
+        verbose : bool, default=True
+            If True, print configuration/progress messages.
+    
+        Returns
+        -------
+        out : healsparse.HealSparseMap
+            Output floating `HealSparseMap` at (`order_out`, `order_cov`). Output dtype
+            is float64 if any positive input is float64, else float32.
+    
+        Notes
+        -----
+        - Order conversion is done per coverage row: coarser stages are expanded to 
+          target children; finer stages are degraded to target children (with values 
+          aggregated within each target pixel).
+        - In callable mode, per-row stacks can be larger than reducer-string mode;
+          prefer the built-in reducers when possible for performance.
+        - When `ignore_sentinel=True`, sentinel values are treated as "not present"
+          and do not contribute to the union/reduction.
+        """
+        if not positive_maps:
+            raise ValueError("combine(): need at least one positive stage.")
+
+        neg_maps = list(negative_maps or [])
+
+        # Target geometry
+        tgt_ord = order_out if order_out is not None else self.order_out
+        cov_ord = order_cov if order_cov is not None else self.order_cov
+        tgt_ns = 1 << int(tgt_ord)
+        cov_ns = 1 << int(cov_ord)
+
+        # Sentinel policy
+        if sentinel is None:
+            # Prefer the first map's sentinel if present, else fall back to 0.0
+            sentinel = self._float_sentinel(positive_maps[0], default=0.0)
+        sentinel = float(sentinel)
+
+        # Align coverage for all maps (and validate dtype)
+        aligned_pos = []
+        for i, m in enumerate(positive_maps):
+            if not self._is_float_map(m):
+                raise TypeError(f"Float combine requires float32/float64 inputs; got {getattr(m, 'dtype', None)!r} at index {i}.")
+            if int(np.log2(m.nside_coverage)) != cov_ord:
+                # change_cov_order() now supports float maps
+                aligned_pos.append(self.change_cov_order(m, order=cov_ord, inplace=False, verbose=False))
+            else:
+                aligned_pos.append(m)
+
+        aligned_neg = []
+        for m in neg_maps:
+            if int(np.log2(m.nside_coverage)) != cov_ord:
+                aligned_neg.append(self.change_cov_order(m, order=cov_ord, inplace=False, verbose=False))
+            else:
+                aligned_neg.append(m)
+
+        # Determine output dtype (float64 if any input is float64)
+        out_dt = np.float64 if any(np.dtype(x.dtype) == np.float64 for x in aligned_pos) else np.float32
+
+        # Reduce op selection
+        op = operation
+        if isinstance(op, str):
+            op_key = op.lower().strip()
+        else:
+            op_key = "<callable>"
+
+        if verbose:
+            print(f"[combine:float] target=(o{tgt_ord}, c{cov_ord}), op={op_key}, sentinel={sentinel}")
+
+        # Helpers ------------------------------------------------------------
+        def _order(nside: int) -> int:
+            return int(round(math.log2(int(nside))))
+
+        it_by_cov = globals().get("_iter_valid_by_covpix", None)
+
+        def _iter_valid_by_cov_fallback(hspmap):
+            vp = hspmap.valid_pixels
+            if vp.size == 0:
+                return
+            nside_cov0 = int(hspmap.nside_coverage)
+            nside_spa0 = int(hspmap.nside_sparse)
+            ratio0 = nside_spa0 // nside_cov0
+            nfine0 = ratio0 * ratio0
+            cov = vp // nfine0
+            order0 = np.argsort(cov, kind="mergesort")
+            vp = vp[order0]
+            cov = cov[order0]
+            i = 0
+            n = vp.size
+            while i < n:
+                c = cov[i]
+                j = i + 1
+                while j < n and cov[j] == c:
+                    j += 1
+                yield int(c), vp[i:j]
+                i = j
+
+        def _iter_cov_rows(hspmap):
+            return it_by_cov(hspmap) if callable(it_by_cov) else _iter_valid_by_cov_fallback(hspmap)
+
+        class CovRowIter:
+            __slots__ = ("gen", "peek", "done")
+            def __init__(self, gen):
+                self.gen = gen
+                self.peek = None
+                self.done = False
+            def get_for_cov(self, cov_id):
+                if self.done:
+                    return None
+                while True:
+                    if self.peek is None:
+                        try:
+                            self.peek = next(self.gen)
+                        except StopIteration:
+                            self.done = True
+                            self.peek = None
+                            return None
+                    if self.peek[0] < cov_id:
+                        self.peek = None
+                        continue
+                    break
+                if self.peek is not None and self.peek[0] == cov_id:
+                    arr = self.peek[1]
+                    try:
+                        self.peek = next(self.gen)
+                    except StopIteration:
+                        self.done = True
+                        self.peek = None
+                    return arr
+                return None
+
+        def _row_to_target_offsets_vals(m, pix_abs: np.ndarray, cov: int, s_ord: int):
+            """Return (off:int64, val:float) at target order for a single coverage row."""
+            if pix_abs is None or pix_abs.size == 0:
+                return None, None
+
+            # Compute per-row bases
+            parents_per_cov_src = 4 ** (s_ord - cov_ord)
+            base_src = cov * parents_per_cov_src
+            nfine_tgt = 4 ** (tgt_ord - cov_ord)
+            base_tgt = cov * nfine_tgt
+
+            # Fetch values and (optionally) drop sentinel
+            vals = m[pix_abs].astype(out_dt, copy=False)
+            if ignore_sentinel:
+                if np.isnan(sentinel):
+                    keep = ~np.isnan(vals)
+                else:
+                    keep = vals != sentinel
+                if not np.all(keep):
+                    pix_abs = pix_abs[keep]
+                    vals = vals[keep]
+                if pix_abs.size == 0:
+                    return None, None
+
+            if s_ord == tgt_ord:
+                off = (pix_abs - base_tgt).astype(np.int64, copy=False)
+                return off, vals
+
+            if s_ord < tgt_ord:
+                # expand parents -> children
+                r2 = 4 ** (tgt_ord - s_ord)
+                parents_local = (pix_abs - base_src).astype(np.int64, copy=False)
+                # children offsets in [0, nfine_tgt)
+                off = (parents_local[:, None] * r2 + np.arange(r2, dtype=np.int64)).reshape(-1)
+                v = np.repeat(vals, r2)
+                return off, v
+
+            # s_ord > tgt_ord: degrade fine -> target; aggregate within each target cell (mean)
+            r2 = 4 ** (s_ord - tgt_ord)
+            off_tgt = ((pix_abs - base_src) // r2).astype(np.int64, copy=False)
+            if off_tgt.size == 0:
+                return None, None
+            u, inv = np.unique(off_tgt, return_inverse=True)
+            # mean within target pixel (ignoring sentinel already handled)
+            sums = np.bincount(inv, weights=vals, minlength=u.size).astype(out_dt, copy=False)
+            cnts = np.bincount(inv, minlength=u.size).astype(np.int64, copy=False)
+            v = sums / np.maximum(cnts, 1)
+            return u, v
+
+        def _neg_row_to_target_offsets(m, pix_abs: np.ndarray, cov: int, s_ord: int):
+            """Return offsets at target order to *remove* for a row, regardless of dtype."""
+            if pix_abs is None or pix_abs.size == 0:
+                return None
+            parents_per_cov_src = 4 ** (s_ord - cov_ord)
+            base_src = cov * parents_per_cov_src
+            nfine_tgt = 4 ** (tgt_ord - cov_ord)
+            base_tgt = cov * nfine_tgt
+
+            # For float negatives, drop sentinel-valued pixels
+            if self._is_float_map(m):
+                vals = m[pix_abs]
+                if np.isnan(self._float_sentinel(m, default=sentinel)):
+                    keep = ~np.isnan(vals)
+                else:
+                    keep = vals != self._float_sentinel(m, default=sentinel)
+                if not np.all(keep):
+                    pix_abs = pix_abs[keep]
+                if pix_abs.size == 0:
+                    return None
+
+            if s_ord == tgt_ord:
+                return (pix_abs - base_tgt).astype(np.int64, copy=False)
+            if s_ord < tgt_ord:
+                r2 = 4 ** (tgt_ord - s_ord)
+                parents_local = (pix_abs - base_src).astype(np.int64, copy=False)
+                return (parents_local[:, None] * r2 + np.arange(r2, dtype=np.int64)).reshape(-1)
+            r2 = 4 ** (s_ord - tgt_ord)
+            off_tgt = ((pix_abs - base_src) // r2).astype(np.int64, copy=False)
+            return np.unique(off_tgt)
+
+        # Iterators for all maps (row-wise)
+        pos_iters = [CovRowIter(_iter_cov_rows(m)) for m in aligned_pos]
+        pos_orders = [_order(m.nside_sparse) for m in aligned_pos]
+        neg_iters = [CovRowIter(_iter_cov_rows(m)) for m in aligned_neg]
+        neg_orders = [_order(m.nside_sparse) for m in aligned_neg]
+
+        for it in pos_iters + neg_iters:
+            it.get_for_cov(-1)  # prime
+
+        # Output map
+        out = self._empty_like_geometry(
+            nside_cov=cov_ns,
+            nside_sparse=tgt_ns,
+            bit_packed=False,
+            dtype=out_dt,
+            sentinel=sentinel,
+        )
+
+        nfine_tgt = 4 ** (tgt_ord - cov_ord)
+
+        # Main streaming merge over covpix present in any positive map
+        while True:
+            cov_candidates = [it.peek[0] for it in pos_iters if it.peek is not None]
+            if not cov_candidates:
+                break
+            cov = int(min(cov_candidates))
+
+            # Collect per-map (offsets, values) at target for this cov
+            off_list = []
+            val_list = []
+            for m, s_ord, it in zip(aligned_pos, pos_orders, pos_iters):
+                pix_abs = it.get_for_cov(cov)
+                if pix_abs is None or pix_abs.size == 0:
+                    continue
+                off, v = _row_to_target_offsets_vals(m, pix_abs, cov, s_ord)
+                if off is None or off.size == 0:
+                    continue
+                # guard row range (should already hold, but safe)
+                sel = (off >= 0) & (off < nfine_tgt)
+                if not np.all(sel):
+                    off = off[sel]
+                    v = v[sel]
+                if off.size:
+                    off_list.append(off.astype(np.int64, copy=False))
+                    val_list.append(v.astype(out_dt, copy=False))
+
+            if not off_list:
+                continue
+
+            # Build union of offsets and reduce
+            all_off = np.concatenate(off_list)
+            uniq_off = np.unique(all_off)
+
+            if isinstance(operation, str):
+                if op_key == "sum" or op_key == "mean":
+                    acc = np.zeros(uniq_off.size, dtype=out_dt)
+                    cnt = np.zeros(uniq_off.size, dtype=np.int32)
+                    for off, v in zip(off_list, val_list):
+                        idx = np.searchsorted(uniq_off, off)
+                        # handle potential duplicates inside a map row (rare but possible): sum them
+                        np.add.at(acc, idx, v)
+                        np.add.at(cnt, idx, 1)
+                    if op_key == "mean":
+                        acc = acc / np.maximum(cnt, 1)
+                    out_vals = acc
+                elif op_key == "min" or op_key == "max":
+                    init = np.inf if op_key == "min" else -np.inf
+                    acc = np.full(uniq_off.size, init, dtype=out_dt)
+                    cnt = np.zeros(uniq_off.size, dtype=np.int32)
+                    for off, v in zip(off_list, val_list):
+                        idx = np.searchsorted(uniq_off, off)
+                        # duplicates inside row: reduce them first to avoid repeated min/max at same idx
+                        # (still safe to do repeated np.minimum/maximum)
+                        if op_key == "min":
+                            np.minimum.at(acc, idx, v)
+                        else:
+                            np.maximum.at(acc, idx, v)
+                        np.add.at(cnt, idx, 1)
+                    # Where nothing contributed, set sentinel
+                    if np.any(cnt == 0):
+                        acc[cnt == 0] = sentinel
+                    out_vals = acc
+                else:
+                    raise ValueError(
+                        "Unsupported float combine operation. "
+                        "Use one of: 'sum', 'mean', 'min', 'max', or pass a callable."
+                    )
+            else:
+                # Callable: build a dense stack (n_maps, n_pix) for this row union.
+                # Missing values are filled with NaN (or sentinel) and the user callable
+                # decides what to do.
+                fill = np.nan if np.isnan(sentinel) else sentinel
+                stack = np.full((len(off_list), uniq_off.size), fill, dtype=out_dt)
+                for k, (off, v) in enumerate(zip(off_list, val_list)):
+                    idx = np.searchsorted(uniq_off, off)
+                    # If duplicates exist, last wins inside that map row
+                    stack[k, idx] = v
+                out_vals = operation(stack)
+                out_vals = np.asarray(out_vals, dtype=out_dt)
+                if out_vals.shape != (uniq_off.size,):
+                    raise ValueError(
+                        "Callable operation must return a 1D array of length equal to the number of union pixels "
+                        "in the row." 
+                    )
+
+            # Apply negatives as a *mask* (remove pixels), preserving the float reduction semantics
+            if aligned_neg and negative_mode.lower().strip() == "mask":
+                neg_parts = []
+                for m, s_ord, it in zip(aligned_neg, neg_orders, neg_iters):
+                    pix_abs = it.get_for_cov(cov)
+                    if pix_abs is None or pix_abs.size == 0:
+                        continue
+                    offn = _neg_row_to_target_offsets(m, pix_abs, cov, s_ord)
+                    if offn is not None and offn.size:
+                        sel = (offn >= 0) & (offn < nfine_tgt)
+                        offn = offn[sel]
+                        if offn.size:
+                            neg_parts.append(np.unique(offn))
+                if neg_parts:
+                    neg_off = np.unique(np.concatenate(neg_parts))
+                    # uniq_off is sorted; use searchsorted for fast mask
+                    hit = np.isin(uniq_off, neg_off, assume_unique=False)
+                    if np.any(hit):
+                        keep = ~hit
+                        uniq_off = uniq_off[keep]
+                        out_vals = out_vals[keep]
+
+            # Drop sentinel-valued outputs to keep output sparse
+            if ignore_sentinel:
+                if np.isnan(sentinel):
+                    keep = ~np.isnan(out_vals)
+                else:
+                    keep = out_vals != sentinel
+                if not np.all(keep):
+                    uniq_off = uniq_off[keep]
+                    out_vals = out_vals[keep]
+
+            if uniq_off.size:
+                base_child = cov * nfine_tgt
+                out_pix = base_child + uniq_off.astype(np.int64, copy=False)
+                # Fast write
+                try:
+                    out.update_values_pix(out_pix, out_vals, operation="replace")
+                except TypeError:
+                    out[out_pix] = out_vals
+
+        return out
+
+
+    def combine(self, positive,*,
+        negative=None, order_out: Optional[int] = None, order_cov: Optional[int] = None,
+        bit_packed: bool = True, verbose: bool = True, output_stage: Optional[str] = None,
+        # float-specific
+        operation: str | Callable | None = None, float_sentinel: Optional[float] = None,
+        float_ignore_sentinel: bool = True, float_negative_mode: str = "mask"):
+        """
+        Combine multiple stage masks into a single mask. This is done in one of two modes, 
+        determined automatically from the *positive* inputs:
+    
+        - **Boolean mode** (all `positive` stages are boolean): supports complex
+          logical combinations where `positive` can contain AND-groups (tuples/lists)
+          that are OR-ed together, and `negative` stages are subtracted at the pixel
+          level. The computation streams row-by-row in coverage space to avoid large
+          dense allocations and to keep the bit-packed workflow fast.
+        - **Float mode** (all `positive` stages are float): combines floating-point
+          maps using a reducer (`operation`) over the union of pixels present in the
+          inputs. Negatives act as a mask (by default), removing pixels from the
+          float output. Float mode does not support AND-groups in `positive`.
+    
+        In both modes, coverage order mismatches across stages are aligned automatically 
+        (via `change_cov_order`), and orders are expanded/degraded as needed.
+    
+        Parameters
+        ----------
+        positive : list
+            Positive inputs to combine. Items can be stage names (str) or
+            `healsparse.HealSparseMap` objects.
+    
+            - **Boolean mode:** each element is either a single stage (OR term) or a
+              tuple/list of stages (AND-group) which is intersected before being
+              OR-ed with the other terms.
+            - **Float mode:** must be a flat list (no tuples/lists).
+    
+        negative : list, optional
+            Negative inputs (stage names or `HealSparseMap`) to subtract/mask out.
+    
+            - **Boolean mode:** negatives are converted per coverage row to the
+              target order and removed from the output.
+            - **Float mode:** negatives are applied according to `float_negative_mode`
+              (currently intended as pixel masking).
+    
+        order_out : int, optional
+            Target sparse order for the output map. If None, defaults to `self.order_out`.
+        order_cov : int, optional
+            Target coverage order for the output map. If None, defaults to `self.order_cov`.
+        bit_packed : bool, default=True
+            Boolean mode only. If True, store the output as a bit-packed boolean map.
+        verbose : bool, default=True
+            If True, print progress/status messages (coverage alignment, orders, and
+            final statistics).
+        output_stage : str, optional
+            Name of the output stage. If None, defaults to the canonical name "mask".
+        operation : str or callable, optional
+            Float mode only: reducer used to combine float maps over the union of
+            present pixels per coverage row. Supported strings: ``"sum"``, ``"mean"``, 
+            ``"min"``, ``"max"``. If a callable is provided, it is called on a stack 
+            of per-map values for the row union (shape ``(n_maps, n_pix)``) and must 
+            return a 1D array of length ``n_pix``. If None, defaults to ``"sum"``.
+        float_sentinel : float, optional
+            Float mode only: sentinel value representing "missing" pixels. If None,
+            the sentinel is inferred from the first positive map when possible, else
+            falls back to 0.0.
+        float_ignore_sentinel : bool, default=True
+            Float mode only: if True, sentinel-valued pixels are ignored in the
+            reducer and sentinel-valued outputs are dropped to keep the output sparse.
+        float_negative_mode : str, default="mask"
+            Float mode only: how negatives are applied. In ``"mask"`` mode, any pixel
+            present in any negative map is removed from the float output.
+    
+        Returns
+        -------
+        mask : healsparse.HealSparseMap
+            The combined mask. In boolean mode, dtype is bool (bit-packed if requested).
+            In float mode, dtype is float32/float64 depending on inputs.
+    
+        Notes
+        -----
+    
+        - Boolean mode: Positives are processed at a "work order" equal to the minimum of
+          `order_out` and the positive stage orders, then expanded to the target order.
+        - Boolean mode: AND-groups within `positive` are intersected per coverage row before OR-ing.
+        - Boolean mode: Negatives are converted per row to target-order children and subtracted
+          before writing.
+        - Float mode: Coverage rows are streamed; within each row, the union of offsets from all
+          positive maps is built and reduced.
+        - Float mode: Inputs are expanded/degraded to the target order per row as needed.
+        - Float mode: Negatives remove pixels from the row union (mask semantics).
+    
         Examples
         --------
-        Combine two stages with AND, add a third stage with OR, and subtract
-        a negative mask:
-
+        Boolean mode: AND two stages, OR with a third, subtract a negative mask:
+    
         >>> mask = mkp.combine(
         ...     positive=[("footmask", "propmask"), "polymask"],
         ...     negative=["starmask"],
         ...     order_out=15,
         ...     order_cov=4,
         ...     bit_packed=True,
-        ...     verbose=True
+        ... )
+    
+        Float mode: sum two float maps and mask out star cores:
+    
+        >>> w = mkp.combine(
+        ...     positive=["starweight_mask", "other_weight_stage"],
+        ...     negative=["starcore_mask"],
+        ...     operation="sum",
+        ...     float_negative_mode="mask",
+        ...     order_out=15,
+        ...     order_cov=4,
         ... )
         """
         if not positive:
             raise ValueError("combine(): need at least one positive stage.")
+
+        # ======================================================================================
+        # Decide whether we're combining boolean masks (existing optimized path)
+        # or floating-point masks (new reducer-based path).
+        #
+        # NOTE: We keep the boolean implementation intact for performance and to avoid
+        # subtle regressions in the bit-packed/huge-mask workflow.
+        # ======================================================================================
+
+        # Resolve orders early (used by both paths)
+        tgt_ord = order_out if order_out is not None else self.order_out
+        cov_ord = order_cov if order_cov is not None else self.order_cov
+
+        # Resolve all inputs once so we can inspect dtypes and (for float) call a different backend.
+        # Preserve `positive` structure for the boolean path, but also build a flat view.
+        pos_flat_maps = []
+        pos_has_and_groups = False
+        for it in positive:
+            if isinstance(it, (tuple, list)):
+                pos_has_and_groups = True
+                for nm in it:
+                    _, m = self._resolve_stage_input(nm)
+                    pos_flat_maps.append(m)
+            else:
+                _, m = self._resolve_stage_input(it)
+                pos_flat_maps.append(m)
+
+        neg_flat_maps = []
+        for nm in (negative or []):
+            _, m = self._resolve_stage_input(nm)
+            neg_flat_maps.append(m)
+
+        pos_any_float = any(self._is_float_map(m) for m in pos_flat_maps)
+        pos_any_bool = any(np.issubdtype(np.dtype(getattr(m, "dtype", np.bool_)), np.bool_) for m in pos_flat_maps)
+
+        # Determine mode from POSITIVES (negatives may be boolean masks even for float mode).
+        if pos_any_float and pos_any_bool:
+            raise TypeError(
+                "combine(): cannot mix boolean and floating-point stages inside `positive`. "
+                "Provide either all-boolean stages or all-float stages."
+            )
+
+        if pos_any_float:
+            if pos_has_and_groups:
+                raise ValueError(
+                    "combine(): float stages do not support AND-groups in `positive` (tuples/lists). "
+                    "Provide a flat list of stages and set `operation=...` (e.g., 'sum', 'mean', 'min', 'max')."
+                )
+            if bit_packed and verbose:
+                print("[combine:float] note: bit_packed=True is ignored for float outputs.")
+
+            op = operation if operation is not None else "sum"
+            res = self._combine_floatmaps(
+                pos_flat_maps,
+                negative_maps=neg_flat_maps,
+                operation=op,
+                order_out=tgt_ord,
+                order_cov=cov_ord,
+                sentinel=float_sentinel,
+                ignore_sentinel=float_ignore_sentinel,
+                negative_mode=float_negative_mode,
+                verbose=verbose,
+            )
+
+            # Persist geometry in the pipeline (mirrors boolean combine())
+            self.order_out = int(tgt_ord)
+            self.order_cov = int(cov_ord)
+            self.nside_out = 1 << int(tgt_ord)
+            self.nside_cov = 1 << int(cov_ord)
+
+            if verbose:
+                try:
+                    area = float(res.get_valid_area(degrees=True))
+                except Exception:
+                    area = float("nan")
+                print(
+                    f"[combine:float] done: order_out={int(tgt_ord)} (NSIDE={1<<int(tgt_ord)}), "
+                    f"order_cov={int(cov_ord)} (NSIDE={1<<int(cov_ord)}), "
+                    f"valid_pix={res.n_valid:,}, area={area:.3f} deg², dtype={res.dtype}"
+                )
+
+            extra_meta = {
+                "combine_kind": "float",
+                "operation": (operation if isinstance(operation, str) else "<callable>"),
+                "sentinel": float(float_sentinel) if float_sentinel is not None else self._float_sentinel(res, default=0.0),
+                "ignore_sentinel": bool(float_ignore_sentinel),
+                "negative_mode": str(float_negative_mode),
+            }
+            return self._finalize_stage(res, default_name="mask", output_stage=output_stage, extra_meta=extra_meta)
 
         # Helpers   ==============================================================
         it_by_cov = globals().get("_iter_valid_by_covpix", None)
@@ -3329,9 +4815,8 @@ class SkyMaskPipe:
             return base_child + local_child
 
         # ======================================================================================
-        # Check if user wants specific orders, otherwise get from defaults
-        tgt_ord = order_out if order_out is not None else self.order_out
-        cov_ord = order_cov if order_cov is not None else self.order_cov
+        # Boolean path (original optimized implementation)
+        # (orders already resolved above)
         #tgt_ord  = int(order_out)
         #cov_ord  = int(order_cov)
         tgt_ns   = 1<<tgt_ord
@@ -3544,9 +5029,25 @@ class SkyMaskPipe:
             raise ValueError(f"Target sparse order {t_ord} < coverage order {c_ord}.")
         tgt_ns = 1<<t_ord
 
-        src_is_packed = bool(getattr(src, "is_bit_packed_map", False))
+        # This helper currently supports boolean (and bit-packed boolean) maps only.
+        # Float resampling is handled inside combine() for now.
+        src_dt = np.dtype(getattr(src, "dtype", np.bool_))
+        src_is_bool = np.issubdtype(src_dt, np.bool_)
+        if not src_is_bool:
+            raise TypeError(
+                "change_sparse_order() currently supports boolean/bit-packed boolean stages only. "
+                "For floating-point maps, resample within combine(..., operation=...) or add a dedicated "
+                "change_sparse_order_float() method."
+            )
+        # Detect dtype / encoding
+        src_dt = np.dtype(getattr(src, "dtype", np.bool_))
+        src_is_bool = np.issubdtype(src_dt, np.bool_)
+        src_is_float = src_dt in (np.float32, np.float64)
+
+        # Only boolean stages can be bit-packed
+        src_is_packed = bool(getattr(src, "is_bit_packed_map", False)) if src_is_bool else False
         if verbose:
-            pack_label = "bit-packed" if src_is_packed else "bool"
+            pack_label = ("bit-packed" if src_is_packed else "bool") if src_is_bool else str(src_dt)
             who = attr_name if attr_name else name_label
 
         # Build regular boolean at source geometry with the same pixels
@@ -3617,9 +5118,14 @@ class SkyMaskPipe:
             raise ValueError(f"Coverage order {t_cov_ord} cannot exceed sparse order {s_ord}.")
         tgt_cov_ns = 1<<t_cov_ord
 
-        src_is_packed = bool(getattr(src, "is_bit_packed_map", False))
+        # Detect dtype / encoding
+        src_dt = np.dtype(getattr(src, "dtype", np.bool_))
+        src_is_bool = np.issubdtype(src_dt, np.bool_)
+        src_is_float = src_dt in (np.float32, np.float64)
+        # Only boolean maps can be bit-packed
+        src_is_packed = bool(getattr(src, "is_bit_packed_map", False)) if src_is_bool else False
         if verbose:
-            pack_label = "bit-packed" if src_is_packed else "bool"
+            pack_label = ("bit-packed" if src_is_packed else "bool") if src_is_bool else str(src_dt)
             who = attr_name if attr_name else name_label
 
         if t_cov_ord == c_ord:
@@ -3627,21 +5133,54 @@ class SkyMaskPipe:
         else:
             # Rebuild map at new coverage and same sparse order
             if verbose:
-                print(f"[change_cov_order] {who} requested change: c{c_ord} → c{t_cov_ord}  (sparse=o{s_ord}, keep={pack_label})")
-            out_reg = hsp.HealSparseMap.make_empty(nside_coverage=tgt_cov_ns,
-                                                   nside_sparse=s_ns,
-                                                   dtype=np.bool_)
-            vp = src.valid_pixels
-            if vp.size: out_reg.update_values_pix(vp, True)
-            out = out_reg.as_bit_packed_map() if src_is_packed else out_reg
+                print(
+                    f"[change_cov_order] {who} requested change: c{c_ord} → c{t_cov_ord}  "
+                    f"(sparse=o{s_ord}, keep={pack_label})"
+                )
+
+            if src_is_bool:
+                out_reg = hsp.HealSparseMap.make_empty(
+                    nside_coverage=tgt_cov_ns,
+                    nside_sparse=s_ns,
+                    dtype=np.bool_,
+                )
+                vp = src.valid_pixels
+                if vp.size:
+                    out_reg.update_values_pix(vp, True)
+                out = out_reg.as_bit_packed_map() if src_is_packed else out_reg
+            elif src_is_float:
+                sent = getattr(src, "sentinel", 0.0)
+                out = hsp.HealSparseMap.make_empty(
+                    nside_coverage=tgt_cov_ns,
+                    nside_sparse=s_ns,
+                    dtype=src_dt,
+                    sentinel=sent,
+                    bit_packed=False,
+                )
+                vp = src.valid_pixels
+                if vp.size:
+                    # Copy values at valid pixels
+                    vals = src[vp]
+                    try:
+                        out.update_values_pix(vp, vals, operation="replace")
+                    except TypeError:
+                        out[vp] = vals
+            else:
+                raise TypeError(f"change_cov_order() does not support dtype {src_dt!r}")
 
         # in-place update if applicable
         if attr_name and inplace: setattr(self, attr_name, out)
 
         if verbose:
-            final_pack = "bit-packed" if getattr(out, "is_bit_packed_map", False) else "bool"
-            print(f"[change_cov_order] {who} done: c{t_cov_ord} (NSIDE={tgt_cov_ns}), sparse=o{s_ord}, "
-                  f"n_valid={out.n_valid:,}, encoding={final_pack}")
+            if src_is_bool:
+                final_pack = "bit-packed" if getattr(out, "is_bit_packed_map", False) else "bool"
+                enc = final_pack
+            else:
+                enc = str(getattr(out, "dtype", src_dt))
+            print(
+                f"[change_cov_order] {who} done: c{t_cov_ord} (NSIDE={tgt_cov_ns}), sparse=o{s_ord}, "
+                f"n_valid={out.n_valid:,}, encoding={enc}"
+            )
 
         return out
 
@@ -4589,3 +6128,716 @@ class SkyMaskPipe:
 
         return df
 
+
+
+    def _pixelate_circles_radial_float(
+        self,
+        data,
+        stage,
+        *,
+        coremask,
+        radial_model: dict,
+        columns: Sequence[str] = ("ra", "dec", "radius"),
+        gmag_col: str = "phot_g_mean_mag",
+        order: int = 15,
+        n_threads: int = 1,
+        chunk_size: int = 250_000,
+        combine_op: str = "max",
+    ) -> None:
+        from mocpy import MOC
+        from astropy.coordinates import Longitude, Latitude
+        from astropy.coordinates import Angle
+    
+        if combine_op not in ("max", "replace"):
+            raise ValueError("combine_op must be 'max' or 'replace'")
+    
+        x_edges = np.asarray(radial_model["x_edges"], dtype=float)
+        if x_edges.ndim != 1 or x_edges.size < 2:
+            raise ValueError("radial_model['x_edges'] must be 1D array with >=2 edges")
+        if np.any(x_edges < 0) or np.any(x_edges > 1.0 + 1e-9):
+            raise ValueError("x_edges must be within [0,1]")
+        if abs(x_edges[-1] - 1.0) > 1e-6:
+            raise ValueError("x_edges[-1] must be 1.0 (normalized to R_comp)")
+    
+        w_of_x = radial_model["w_of_x"]
+        p_of_r = radial_model["p_of_r"]
+        band = radial_model.get("band", "i")
+        weight_quant = float(radial_model.get("weight_quant", 1e-3))
+        delta_depth = int(radial_model.get("delta_depth", 2))
+        p_min = float(radial_model.get("p_min", 0.15))
+    
+        colra, coldec, colrad = columns
+        n_total = len(data)
+        if n_total == 0:
+            return
+    
+        for start in range(0, n_total, chunk_size):
+            end = min(start + chunk_size, n_total)
+            df = data.iloc[start:end]
+    
+            lon = Longitude(df[colra].to_numpy(dtype=float), unit="deg")
+            lat = Latitude(df[coldec].to_numpy(dtype=float), unit="deg")
+            R_deg = df[colrad].to_numpy(dtype=float)
+            R_arcsec = R_deg * 3600.0
+            Gmag = df[gmag_col].to_numpy(dtype=float)
+    
+            for i in range(x_edges.size - 1):
+                xin = float(x_edges[i])
+                xout = float(x_edges[i + 1])
+                if xout <= 0:
+                    continue
+    
+                Rout_deg = (xout * R_arcsec) / 3600.0
+                Rin_deg = (xin * R_arcsec) / 3600.0
+    
+                mocs_out = MOC.from_cones(
+                    lon=lon,
+                    lat=lat,
+                    radius=Angle(Rout_deg, unit="deg"),
+                    max_depth=order,
+                    delta_depth=delta_depth,
+                    n_threads=n_threads,
+                )
+    
+                if xin > 0:
+                    mocs_in = MOC.from_cones(
+                        lon=lon,
+                        lat=lat,
+                        radius=Angle(Rin_deg, unit="deg"),
+                        max_depth=order,
+                        delta_depth=delta_depth,
+                        n_threads=n_threads,
+                    )
+                else:
+                    mocs_in = None
+    
+                # INNER-EDGE evaluation for p and w
+                # For the first ring (xin==0), use midpoint to avoid evaluating exactly at r=0.
+                x_eval = xin if xin > 0 else 0.5 * (xin + xout)
+    
+                w_star = np.empty(len(df), dtype=float)
+                is_core = np.zeros(len(df), dtype=bool)
+    
+                for j, (Ra, G) in enumerate(zip(R_arcsec, Gmag)):
+                    r_eval = x_eval * float(Ra)
+                    p_eval = float(np.asarray(p_of_r(np.array([r_eval]), G=float(G), band=band))[0])
+                    if p_eval < p_min:
+                        is_core[j] = True
+                        w_star[j] = 1.0
+                    else:
+                        w_star[j] = float(w_of_x(x_eval, R_comp_arcsec=float(Ra), G=float(G), band=band))
+    
+                if weight_quant > 0:
+                    w_key = np.round(w_star / weight_quant) * weight_quant
+                else:
+                    w_key = w_star
+    
+                groups = {}
+                core_groups = []
+    
+                for j in range(len(df)):
+                    out_pix = mocs_out[j].flatten().astype(np.int64)
+                    if out_pix.size == 0:
+                        continue
+    
+                    if mocs_in is not None:
+                        in_pix = mocs_in[j].flatten().astype(np.int64)
+                        if in_pix.size > 0:
+                            ring_pix = np.setdiff1d(out_pix, in_pix, assume_unique=False)
+                        else:
+                            ring_pix = out_pix
+                    else:
+                        ring_pix = out_pix
+    
+                    if ring_pix.size == 0:
+                        continue
+    
+                    if is_core[j]:
+                        core_groups.append(ring_pix)
+                        continue
+    
+                    key = float(w_key[j])
+                    groups.setdefault(key, []).append(ring_pix)
+    
+                if (coremask is not None) and core_groups:
+                    hp_core = np.unique(np.concatenate(core_groups)).astype(np.int64)
+                    if hp_core.size > 0:
+                        coremask.update_values_pix(hp_core, True, operation="or")
+    
+                for wval, pix_list in groups.items():
+                    hp_idx = np.unique(np.concatenate(pix_list)).astype(np.int64)
+                    if hp_idx.size == 0:
+                        continue
+    
+                    if combine_op == "replace":
+                        stage.update_values_pix(
+                            hp_idx,
+                            np.full(hp_idx.size, wval, dtype=stage.dtype),
+                            operation="replace",
+                        )
+                    else:
+                        cur = stage.get_values_pix(hp_idx)
+                        new = np.maximum(cur, wval).astype(stage.dtype, copy=False)
+                        stage.update_values_pix(hp_idx, new, operation="replace")
+    
+        return
+
+
+    def _pixelate_circles_profile_weight(self, stars_df, weight_stage, core_stage, dr_min_arcsec: float,
+        profile_model: dict, columns: Sequence[str] = ("ra", "dec"), gmag_col: str = "phot_g_mean_mag",
+        order: int = 15, n_threads: int = 1, chunk_size: int = 200_000) -> None:
+        """
+        Pixelize bright-star radial *weight profiles* into sparse stages. This aux method streams a 
+        per-star, magnitude-dependent radial profile into two stages:
+    
+          - ``core_stage`` (bool): a *core* disc mask with radius ``r_in``.
+          - ``weight_stage`` (float): annular rings between ``r_in`` and ``r_out`` filled
+            with completeness-correction weights ``w = 1 / p(r)``, where ``p(r)`` is
+            the profile value evaluated from `profile_model` at radius ``r`` (arcsec).
+    
+        Stars are processed in chunks (`chunk_size`) to limit peak memory. For each chunk,
+        stars are grouped by (magnitude bin, quantized ``r_in``, quantized ``r_out``) to
+        reduce repeated MOC construction. Rings are built at a radial resolution set by
+        ``dr_min_arcsec``; radii are quantized so that ``r_in`` never moves inward and
+        ``r_out`` never moves outward (and is forced to be ``>= r_in``).
+    
+        Weights are combined into ``weight_stage`` using a *max-combine* rule at the pixel
+        level (i.e. overlapping contributions keep the largest weight).
+    
+        Parameters
+        ----------
+        stars_df : pandas.DataFrame
+            Input star table. Must contain the coordinate columns given by `columns`
+            (in degrees) and a magnitude column `gmag_col`.
+        weight_stage : healsparse.HealSparseMap
+            Output floating-point stage to be updated in-place with ring weights.
+            It is assumed to use sentinel/background weight = 1.0.
+        core_stage : healsparse.HealSparseMap
+            Output boolean stage to be updated in-place with the star cores
+            (disc radius ``r_in``).
+        profile_model : dict
+            Star profile model built with `build_model_from_densprof()`. The model must
+            provide a ``library`` (`ProfileLibrary`) with methods used here:
+    
+              - ``pick_mag_bin(gmag)``
+              - ``radii_for_levels(band, mag_bin, p_floor_level, p_comp_level)``
+              - ``p_of_r(r_arcsec, band, mag_bin)``
+    
+            The model also provides:
+    
+              - ``band`` : str
+              - ``p_floor_level`` : float
+              - ``p_comp_level`` : float
+              - ``w_cap`` : optional float cap on the final weight
+              - ``weight_quant`` : optional quantization step for weights (default 1e-3)
+
+        dr_min_arcsec : float
+            Minimum radial step (arcsec) used to discretize the profile into rings.
+            This sets the ring edge spacing and the radius quantization scale.
+        columns : sequence of str, default=("ra", "dec")
+            Names of the RA/Dec columns in `stars_df` (degrees).
+        gmag_col : str, default="phot_g_mean_mag"
+            Name of the Gaia G-band magnitude column.
+        order : int, default=15
+            HEALPix order (``nside = 2**order``) used when building MOCs for the discs/rings.
+        n_threads : int, default=1
+            Number of threads passed to `mocpy.MOC.from_cones`.
+        chunk_size : int, default=200000
+            Number of stars processed per streaming chunk.
+    
+        Returns
+        -------
+        None
+            Updates `weight_stage` and `core_stage` in-place.
+    
+        Notes
+        -----
+        - Radii are evaluated per star from `ProfileLibrary.radii_for_levels()` using the
+          magnitude bin derived from `ProfileLibrary.pick_mag_bin()`.
+        - Rings are generated by differencing two cone MOCs (outer minus inner), and the
+          ring weight is evaluated at the inner edge of each ring to guarantee the maximum
+          weight occurs at the first annulus outside the core.
+        - Overlaps are resolved with a max-combine rule for `weight_stage`.
+        """
+        
+        from mocpy import MOC
+        from astropy.coordinates import Longitude, Latitude
+        from astropy.coordinates import Angle
+    
+        lib: ProfileLibrary = profile_model["library"]
+        band = profile_model["band"]
+        p_floor_level = float(profile_model["p_floor_level"])
+        p_comp_level = float(profile_model["p_comp_level"])
+        w_cap = profile_model.get("w_cap", None)
+        weight_quant = float(profile_model.get("weight_quant", 1e-3))
+    
+        colra, coldec = columns
+        if len(stars_df) == 0:
+            return
+    
+        q = float(dr_min_arcsec)
+    
+        n_total = len(stars_df)
+        for start in range(0, n_total, chunk_size):
+            end = min(start + chunk_size, n_total)
+            df = stars_df.iloc[start:end]
+    
+            lon = Longitude(df[colra].to_numpy(dtype=float), unit="deg")
+            lat = Latitude(df[coldec].to_numpy(dtype=float), unit="deg")
+            G = df[gmag_col].to_numpy(dtype=float)
+    
+            mag_bins = [lib.pick_mag_bin(float(g)) for g in G]
+    
+            # per-star r_in/r_out (arcsec)
+            r_in = np.empty(len(df), dtype=float)
+            r_out = np.empty(len(df), dtype=float)
+            for j, mb in enumerate(mag_bins):
+                rin, rout = lib.radii_for_levels(band=band, mag_bin=mb, p_floor_level=p_floor_level, p_comp_level=p_comp_level)
+                r_in[j] = rin
+                r_out[j] = rout
+    
+            # quantize radii to resolution scale
+            r_in_q  = np.ceil(r_in  / q) * q          # never move inward
+            r_out_q = np.floor(r_out / q) * q         # optional: never move outward
+            r_out_q = np.maximum(r_out_q, r_in_q)
+    
+            # group indices
+            groups: Dict[Tuple[Any, float, float], List[int]] = {}
+            for j, (mb, rin, rout) in enumerate(zip(mag_bins, r_in_q, r_out_q)):
+                if not np.isfinite(rin) or not np.isfinite(rout):
+                    continue
+                groups.setdefault((mb, float(rin), float(rout)), []).append(j)
+    
+            for (mb, rin_a, rout_a), idxs in groups.items():
+                if rin_a < 0 or rout_a <= 0:
+                    continue
+    
+                lon_g = lon[idxs]
+                lat_g = lat[idxs]
+    
+                # --- core mask: disc r_in
+                if rin_a > 0:
+                    moc_core = MOC.from_cones(
+                        lon=lon_g,
+                        lat=lat_g,
+                        radius=Angle(np.full(len(idxs), rin_a / 3600.0), unit="deg"),
+                        max_depth=order,
+                        delta_depth=2,
+                        n_threads=n_threads,
+                    )
+                    core_pix = np.unique(np.concatenate([m.flatten().astype(np.int64) for m in moc_core]))
+                    if core_pix.size:
+                        core_stage.update_values_pix(core_pix, True, operation="or")
+    
+                # --- weight annuli: [r_in, r_out]
+                if rout_a <= rin_a:
+                    continue
+    
+                edges = np.arange(rin_a, rout_a + q, q, dtype=float)
+                if edges.size < 2:
+                    edges = np.array([rin_a, rout_a], dtype=float)
+                edges[-1] = rout_a  # ensure exact end
+    
+                for k in range(len(edges) - 1):
+                    r0 = float(edges[k])
+                    r1 = float(edges[k + 1])
+                    if r1 <= r0:
+                        continue
+    
+                    # weight evaluated at ring inner edge (guarantees max at first ring)
+                    p0 = float(np.asarray(lib.p_of_r(np.array([r0], dtype=float), band=band, mag_bin=mb))[0])
+                    if p0 <= 0:
+                        w = 1.0
+                    else:
+                        w = 1.0 / p0
+                        if w < 1.0:
+                            w = 1.0
+                        if w_cap is not None:
+                            w = min(w, float(w_cap))
+    
+                    if weight_quant > 0:
+                        w = float(np.round(w / weight_quant) * weight_quant)
+    
+                    moc_out = MOC.from_cones(
+                        lon=lon_g,
+                        lat=lat_g,
+                        radius=Angle(np.full(len(idxs), r1 / 3600.0), unit="deg"),
+                        max_depth=order,
+                        delta_depth=2,
+                        n_threads=n_threads,
+                    )
+                    moc_in = MOC.from_cones(
+                        lon=lon_g,
+                        lat=lat_g,
+                        radius=Angle(np.full(len(idxs), r0 / 3600.0), unit="deg"),
+                        max_depth=order,
+                        delta_depth=2,
+                        n_threads=n_threads,
+                    )
+    
+                    ring_pix_all = []
+                    for mo, mi in zip(moc_out, moc_in):
+                        po = mo.flatten().astype(np.int64)
+                        if po.size == 0:
+                            continue
+                        pi = mi.flatten().astype(np.int64)
+                        ring = np.setdiff1d(po, pi, assume_unique=False) if pi.size else po
+                        if ring.size:
+                            ring_pix_all.append(ring)
+    
+                    if not ring_pix_all:
+                        continue
+    
+                    hp_idx = np.unique(np.concatenate(ring_pix_all)).astype(np.int64)
+                    if hp_idx.size == 0:
+                        continue
+    
+                    # max-combine (manual)
+                    cur = weight_stage.get_values_pix(hp_idx)
+                    new = np.maximum(cur, w).astype(weight_stage.dtype, copy=False)
+                    weight_stage.update_values_pix(hp_idx, new, operation="replace")
+    
+        return
+
+    
+
+    def apply(self, stage: str = "mask", cat: Union[pd.DataFrame, Table, None] = None,
+        columns: Sequence[str] = ("ra", "dec"), file: Optional[str] = None, *,
+        weight_col: str = "weight", sentinel: Optional[float] = None, include_background: bool = False,
+        default_weight: float = 1.0, rtol: float = 1e-6, atol: float = 0.0) -> Union[pd.DataFrame, Table]:
+        """
+        Apply a boolean or weighted mask to a catalog.
+    
+        - Boolean stage:
+            returns only sources where the mask value is True.
+        - Floating-point stage:
+            * include_background=False (default):
+                  return only sources inside the float mask
+                  (value != sentinel) and add a `weight` column.
+            * include_background=True:
+                  return all sources and add a `weight` column everywhere;
+                  note that sources outside the mask get weight=default_weight (NOT the sentinel).
+    
+        Parameters
+        ----------
+        stage : str
+            Stage name, e.g. 'mask', 'footmask', 'starweight_mask'.
+        cat : pandas.DataFrame or astropy.table.Table
+            Input catalog.
+        columns : (str, str)
+            RA, Dec column names (degrees).
+        file : str, optional
+            Output path (DataFrame -> parquet; Table -> inferred format).
+        weight_col : str
+            Name of the weight column for float stages.
+        sentinel : float, optional
+            Sentinel/background value for float stages.
+            If None, uses mk.sentinel if present, else defaults to 1.0.
+        include_background : bool
+            For float stages only:
+            - False: keep only sources inside the float mask
+            - True: keep all sources and attach weights
+        default_weight : float
+            For float stages only, when include_background=True:
+            weight assigned to sources outside the float mask (overrides sentinel/NaNs).
+        rtol, atol : float
+            Tolerance for sentinel comparisons.
+    
+        Returns
+        -------
+        pandas.DataFrame or astropy.table.Table
+            Masked/weighted catalog.
+        """
+        if cat is None:
+            raise ValueError("cat must be provided")
+    
+        colra, coldec = columns
+        mk = getattr(self, stage)
+    
+        # Decide float vs boolean stage
+        mk_dtype = getattr(mk, "dtype", None)
+        is_float = (mk_dtype is not None) and np.issubdtype(mk_dtype, np.floating)
+    
+        # Query map at source positions
+        vals = mk.get_values_pos(cat[colra], cat[coldec], lonlat=True)
+        vals = np.asarray(vals)
+    
+        # Boolean stage ------------------------------------
+        if not is_float:
+            idx = vals.astype(bool)
+            out = cat[idx]
+    
+            if file:
+                if isinstance(out, pd.DataFrame):
+                    out.to_parquet(file)
+                else:
+                    out.write(file, overwrite=True)
+                print(f"{len(out)} sources within {stage} written to: {file}")
+            else:
+                print(f"{len(out)} sources within {stage}")
+    
+            return out
+    
+        # Float stage ----------------------------------------
+        if sentinel is None:
+            sentinel = getattr(mk, "sentinel", None)
+        if sentinel is None:
+            sentinel = 1.0
+    
+        # Define "inside mask"
+        if np.isnan(sentinel):
+            inside = ~np.isnan(vals)
+        else:
+            inside = ~np.isclose(vals, sentinel, rtol=rtol, atol=atol)
+
+        n_total = len(vals)
+        n_inside = int(np.count_nonzero(inside))
+        n_outside = n_total - n_inside
+        
+        # Select rows + build weights
+        if include_background:
+            sel = slice(None)
+            w_out = vals.copy()
+    
+            # Override outside weights (including NaN sentinel case)
+            w_out[~inside] = default_weight
+    
+            # Also handle NaNs that might appear even if sentinel is not NaN
+            # (defensive: keep output weights finite if user wants)
+            if np.isnan(sentinel):
+                # already covered by ~inside above
+                pass
+    
+        else:
+            sel = inside
+            w_out = vals[inside]
+    
+        # Build output
+        if isinstance(cat, pd.DataFrame):
+            out = cat.loc[sel].copy()
+            out[weight_col] = w_out
+    
+            if file:
+                out.to_parquet(file)
+                print(
+                    f"{len(out)} sources written to: {file} "
+                    f"(inside_with_weights={n_inside}, outside={n_outside}, total={n_total})" )
+            else:
+                print(
+                    f"{len(out)} sources returned "
+                    f"(inside_with_weights={n_inside}, outside={n_outside}, total={n_total})" )
+    
+            return out
+    
+        if isinstance(cat, Table):
+            out = cat[sel]
+            if weight_col in out.colnames:
+                out[weight_col] = w_out
+            else:
+                out.add_column(w_out, name=weight_col)
+    
+            if file:
+                out.write(file, overwrite=True)
+                print(
+                    f"{len(out)} sources written to: {file} "
+                    f"(inside_with_weights={n_inside}, outside={n_outside}, total={n_total})" )
+            else:
+                print(
+                    f"{len(out)} sources returned "
+                    f"(inside_with_weights={n_inside}, outside={n_outside}, total={n_total})" )
+    
+            return out
+    
+        raise TypeError("cat must be a pandas.DataFrame or astropy.table.Table")
+
+    
+
+
+    def build_star_weightmask_online(self, starq: dict, *,
+        order_sparse: int = 15, order_cov: Optional[int] = None,
+        columns: Sequence[str] = ("ra", "dec"), gmag_col: str = "phot_g_mean_mag",
+        profile_model: dict, output_stage_weight: str = "starweight_mask",
+        output_stage_core: str = "starcore_mask", n_threads: int = 4,
+        chunk_size: int = 400_000, save_stars: bool = False, verbose: bool = True):
+        """
+        Build a bright-star *weight* mask on the fly by querying a remote catalog.
+    
+        This method constructs two `HealSparseMap` stages associated with bright stars by:
+        (1) defining a search region from a user-supplied `search_stage`,
+        (2) querying the Gaia catalog in chunks of sky defined by a MOC,
+        (3) pixelizing a radial weight profile around each star at the requested order,
+        and (4) streaming results directly into a sparse floating-point weight map and a
+        boolean core mask. The weight map is initialized with background weight = 1.0 
+        everywhere, and is then updated locally around stars according to
+        `profile_model` (built with `build_model_from_densprof()`).
+    
+        By default, the final stages are stored in the attributes named by
+        `output_stage_weight` and `output_stage_core`.
+    
+        Parameters
+        ----------
+        starq : dict
+            Dictionary of parameters controlling the online star query and sky chunking.
+            Required keys:
+    
+              - ``search_stage`` : `HealSparseMap` defining the search region (via valid pixels).
+              - ``cat`` : catalog identifier to open with `lsdb.open_catalog`.
+              - ``columns`` : list of columns to load from the Gaia catalog.
+              - ``gaia_gmag_lims`` : tuple ``(gmin, gmax)`` magnitude limits applied on `gmag_col`.
+    
+            Optional keys:
+    
+              - ``avoid_mw`` : bool, if True subtract a Milky Way disc+bulge region from the search MOC.
+              - ``b0_deg`` : float, latitude cut for the MW disc (deg), used if ``avoid_mw=True``.
+              - ``bulge_a_deg`` : float, bulge semi-major axis (deg), used if ``avoid_mw=True``.
+              - ``bulge_b_deg`` : float, bulge semi-minor axis (deg), used if ``avoid_mw=True``.
+    
+              - ``max_area_single`` : maximum deg² before splitting into multiple chunks (default 800).
+              - ``target_chunk_area`` : target deg² per MOC chunk (default 800).
+              - ``coarse_order_bfs`` : order for initial chunk splitting (default 5).
+    
+        order_sparse : int, optional
+            Sparse order for pixelizing the star profiles (defines the weight map resolution).
+        order_cov : int, optional
+            Coverage order. Defaults to `self.order_cov`.
+        columns : sequence of str, optional
+            Column names expected in the star DataFrame for coordinates. Defaults to ``("ra", "dec")``.
+        gmag_col : str, default="phot_g_mean_mag"
+            Name of the Gaia G-band magnitude column used for magnitude filtering and
+            for evaluating the profile model.
+        profile_model : dict
+            Star profile model built with `build_model_from_densprof()`. Must have
+            ``profile_model["mode"] == "profile_arcsec_v2"``. Controls the weight profile,
+            including band/levels and optional caps.
+        output_stage_weight : str, default="starweight_mask"
+            Attribute/stage name to store the output floating-point weight map.
+        output_stage_core : str, default="starcore_mask"
+            Attribute/stage name to store the output bit-packed boolean core mask.
+        n_threads : int, default=4
+            Number of threads used during profile pixelization.
+        chunk_size : int, default=400000
+            Number of stars (circles) processed at once during pixelization. Watch out for
+            memory if `chunk_size` and `n_threads` are both large.
+        save_stars : bool, default=False
+            If True, for each chunk piece save the retrieved stars to parquet format.
+        verbose : bool, default=True
+            If True, print progress information (orders, pixel scale, chunking, and per-chunk counts).
+    
+        Returns
+        -------
+        starweight_mask : healsparse.HealSparseMap
+            Floating-point star weight mask as a `HealSparseMap` (sentinel/background = 1.0),
+            also stored as `self.<output_stage_weight>` when possible. A corresponding core
+            mask is finalized and stored as `self.<output_stage_core>`.
+        """
+    
+        if profile_model.get("mode") != "profile_arcsec_v2":
+            raise ValueError("profile_model must be built with build_model_from_densprof().")
+    
+        ord_cov = order_cov if order_cov is not None else self.order_cov
+        nside_sparse = 1 << int(order_sparse)
+        nside_cov = 1 << int(ord_cov)
+    
+        # output stages (background weight=1.0)
+        wmap = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.float32, sentinel=1.0, bit_packed=False)
+        coremask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_, sentinel=False, bit_packed=True)
+    
+        MAX_DEPTH = 8
+        search_stage = starq["search_stage"]
+        if not isinstance(search_stage, hsp.HealSparseMap):
+            raise TypeError("search_stage must be a HealSparseMap")
+    
+        order_search_stg = int(np.log2(search_stage.nside_sparse))
+        moc = MOC.from_healpix_cells(ipix=search_stage.valid_pixels, depth=order_search_stg, max_depth=MAX_DEPTH)
+    
+        # Optional MW subtraction
+        avoid_mw = starq.get("avoid_mw", False)
+        b0_deg = starq.get("b0_deg", 15.0)
+        bulge_a_deg = starq.get("bulge_a_deg", 10.0)
+        bulge_b_deg = starq.get("bulge_b_deg", 6.0)
+        if avoid_mw:
+            moc_pb = self.gal_plane_bulge_moc(
+                max_depth=MAX_DEPTH, b0_deg=b0_deg, bulge_a_deg=bulge_a_deg, bulge_b_deg=bulge_b_deg
+            )
+            moc = moc.difference(moc_pb)
+    
+        # Chunking
+        max_area_sing = starq.get("max_area_single", 800.0)
+        target_chunk_area = starq.get("target_chunk_area", 800.0)
+        coarse_order_bfs = starq.get("coarse_order_bfs", 5)
+    
+        moc_area = getarea_moc(moc)
+        if moc_area < max_area_sing:
+            chunk_mocs = [moc.add_neighbours()]
+        else:
+            chunk_mocs = split_moc_into_chunks(moc, target_deg2=target_chunk_area, coarse_order=coarse_order_bfs)
+            chunk_mocs = [c.intersection(moc).add_neighbours() for c in chunk_mocs]
+    
+        #radfunction = starq["radfunction"]
+        #if not callable(radfunction):
+        #    raise TypeError("starq['radfunction'] must be callable (can be a no-op).")
+    
+        gaia = lsdb.open_catalog(starq["cat"], columns=starq["columns"],
+            search_filter=MOCSearch(moc),
+            filters=[
+                [gmag_col, ">", starq["gaia_gmag_lims"][0]],
+                [gmag_col, "<", starq["gaia_gmag_lims"][1]]] )
+    
+        pix_arcsec = healpix_pixel_size_arcsec(nside_sparse)
+        dr_factor = float(profile_model.get("dr_factor", 1.0))
+        dr_min_arcsec = max(pix_arcsec * dr_factor, pix_arcsec)
+    
+        if verbose:
+            print("BUILDING STAR WEIGHTMASK >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
+            print(f"  order_sparse={order_sparse} nside_sparse={nside_sparse}  pix~{pix_arcsec:.2f}\"  dr_min~{dr_min_arcsec:.2f}\"")
+            print(f"  band={profile_model['band']}  p_floor={profile_model['p_floor_level']}  p_comp={profile_model['p_comp_level']}  w_cap={profile_model.get('w_cap')}")
+            print(f"  chunks={len(chunk_mocs)}")
+    
+        for i, mi in enumerate(chunk_mocs, 1):
+            if verbose:
+                print(f"Chunk {i}/{len(chunk_mocs)}: querying catalog ...")
+            s = gaia.moc_search(moc=mi).compute()
+            if verbose:
+                print(f"--- Stars found : {len(s)}")
+            if len(s) == 0:
+                continue
+    
+            #radfunction(s)
+    
+            if save_stars:
+                fn = f"stars_chunk_{i:02d}.parquet"
+                s.to_parquet(fn)
+                if verbose:
+                    print("---", fn, "written to disk")
+    
+            self._pixelate_circles_profile_weight(
+                s, wmap, coremask, profile_model=profile_model, order=order_sparse,
+                columns=columns, gmag_col=gmag_col, n_threads=n_threads, chunk_size=chunk_size,
+                dr_min_arcsec=dr_min_arcsec)
+    
+            del s
+            gc.collect()
+    
+        meta_weight = dict(
+            kind="starweight_nonhalo_v2",
+            profile_mode="profile_arcsec_v2",
+            band=str(profile_model["band"]),
+            p_floor_level=float(profile_model["p_floor_level"]),
+            p_comp_level=float(profile_model["p_comp_level"]),
+            w_cap=profile_model.get("w_cap", None),
+            dr_min_arcsec=float(dr_min_arcsec) )
+        meta_core = dict(meta_weight)
+        meta_core["kind"] = "starcore_nonhalo_v2"
+    
+        out_w = self._finalize_stage(wmap, default_name="starweight_mask", 
+                                     output_stage=output_stage_weight, extra_meta=meta_weight)
+        out_c = self._finalize_stage(coremask, default_name="starcore_mask", 
+                                     output_stage=output_stage_core, extra_meta=meta_core)
+    
+        try:
+            setattr(self, output_stage_weight, out_w)
+            setattr(self, output_stage_core, out_c)
+        except Exception:
+            pass
+    
+        return out_w
