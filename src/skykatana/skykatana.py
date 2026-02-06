@@ -1137,12 +1137,15 @@ class SkyMaskPipe:
                 lon=Longitude(table[colra][start:end], unit='deg'),
                 lat=Latitude(table[coldec][start:end], unit='deg'),
                 radius=Angle(table[colrad][start:end], unit='deg'),
-                max_depth=order, delta_depth=delta_depth, n_threads=n_threads)
+                max_depth=order, delta_depth=delta_depth, n_threads=n_threads, union_strategy="small_cones")
 
-            #if not mocs: continue
-            hp_idx = np.concatenate([moc.flatten() for moc in mocs])
-            #if not hp_idx: continue
-            hp_idx = np.unique(hp_idx).astype(np.int64)
+            # Small_cones already returns a single MOC for all stars
+            hp_idx = np.array(mocs.flatten()).astype(np.int64)
+
+            ##if not mocs: continue
+            #hp_idx = np.concatenate([moc.flatten() for moc in mocs])
+            ##if not hp_idx: continue
+            #hp_idx = np.unique(hp_idx).astype(np.int64)
 
             # Stream directly into the sparse map
             stage.update_values_pix(hp_idx, True)
@@ -2973,10 +2976,10 @@ class SkyMaskPipe:
                              fill=True, edge=True, fillColor=color)
         except Exception as e:
             # Build a concise diagnostic
-            tname = type(moc_input).__name__
+            tname = type(moc).__name__
             preview = ""
             try:
-                s = repr(moc_input)
+                s = repr(moc)
                 preview = (s[:200] + ("..." if len(s) > 200 else ""))
             except Exception:
                 preview = "<unrepr-able>"
