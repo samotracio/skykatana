@@ -393,6 +393,563 @@ def _write_stage_fits_bitpack(stage_path: str | os.PathLike, hspmap,
 
 
 
+
+# ----------------------------------------------------------------------
+# Bitpack helpers: write/read directly from packed uint64 blocks
+# ----------------------------------------------------------------------
+
+def _moc_to_covpix_list(moc, cov_order: int) -> np.ndarray:
+    """Return coverage pixels (NESTED) at `cov_order` that cover the given MOC.
+
+    This is used to pre-allocate / bound GPU bitpack painting. The returned list must
+    be a *superset* of touched coverage pixels for correctness.
+    """
+    cov_order = int(cov_order)
+    m2 = moc
+    try:
+        # mocpy >= 0.13
+        if hasattr(moc, "degrade_to_order"):
+            m2 = moc.degrade_to_order(cov_order)
+        elif hasattr(moc, "degrade"):
+            m2 = moc.degrade(cov_order)
+        elif hasattr(moc, "to_depth"):
+            m2 = moc.to_depth(cov_order)
+    except Exception:
+        m2 = moc
+    try:
+        # Ensure max depth is cov_order
+        if getattr(m2, "max_order", getattr(m2, "max_depth", None)) not in (None, cov_order):
+            # last resort: re-create by flattening then building a new MOC
+            pass
+    except Exception:
+        pass
+    try:
+        cv = np.asarray(m2.flatten(), dtype=np.int64)
+    except Exception:
+        # Fallback: empty
+        cv = np.empty(0, dtype=np.int64)
+    return cv
+
+
+def _write_stage_fits_bitpack_from_packed_dict(stage_path,
+                                              packed_blocks: dict[int, np.ndarray],
+                                              *, nside_cov: int, nside_spa: int,
+                                              trim_trailing_zeros: bool = True,
+                                              rows_per_batch: int = 32768) -> None:
+    """Write BITPACK stage FITS directly from dict[covpix] -> uint64 words (little-endian).
+
+    Parameters
+    ----------
+    stage_path : path
+        Output FITS path.
+    packed_blocks : dict[int, np.ndarray]
+        Mapping from coverage pixel (at cov_order) to a 1D uint64 array of packed bits.
+        Bit 0 is LSB (BITORD='L'). Arrays may have trailing zero words.
+    nside_cov, nside_spa : int
+        HealSparse geometry. Must satisfy nside_spa % nside_cov == 0 and NESTED scheme.
+    trim_trailing_zeros : bool
+        If True, truncate trailing all-zero bytes per row before writing (PB() is variable length).
+    rows_per_batch : int
+        Streaming batch size for FITS append.
+    """
+    nside_cov = int(nside_cov); nside_spa = int(nside_spa)
+    if nside_spa % nside_cov != 0:
+        raise ValueError("nside_sparse must be a multiple of nside_coverage (NESTED).")
+    ratio = nside_spa // nside_cov
+    nfine = ratio * ratio
+
+    keys = sorted(int(k) for k in packed_blocks.keys())
+    with fitsio.FITS(str(stage_path), mode="rw", clobber=True) as f:
+        f.create_table_hdu(
+            names=['COVPIX', 'ENC', 'PACKED'],
+            formats=['K', 'B', 'PB()'],
+        )
+        f[-1].write_keys({
+            'NSIDE_COV': nside_cov,
+            'NSIDE_SPA': nside_spa,
+            'DTYPE':     'bool',
+            'ENCOD':     'BITPACK',
+            'NFINE':     int(nfine),
+            'BITORD':    'L',
+        })
+
+        batch_cov = np.empty(rows_per_batch, dtype=np.int64)
+        batch_enc = np.empty(rows_per_batch, dtype=np.uint8)
+        batch_pac = [None] * rows_per_batch
+
+        nbuf = 0
+        for cv in keys:
+            row_u64 = np.asarray(packed_blocks[cv], dtype=np.uint64)
+            u8 = row_u64.view(np.uint8)
+            if trim_trailing_zeros and u8.size:
+                nz = np.nonzero(u8)[0]
+                if nz.size == 0:
+                    # empty row (ENC=0, PACKED=empty)
+                    packed_u8 = np.empty(0, dtype=np.uint8)
+                    enc = np.uint8(0)
+                else:
+                    packed_u8 = u8[:int(nz[-1]) + 1].copy()
+                    enc = np.uint8(1)
+            else:
+                packed_u8 = u8.copy()
+                enc = np.uint8(1 if packed_u8.size and np.any(packed_u8) else 0)
+
+            batch_cov[nbuf] = np.int64(cv)
+            batch_enc[nbuf] = enc
+            batch_pac[nbuf] = packed_u8
+            nbuf += 1
+
+            if nbuf >= rows_per_batch:
+                pac_obj = np.asarray(batch_pac[:nbuf], dtype=object)
+
+                f[-1].append({'COVPIX': batch_cov[:nbuf], 'ENC': batch_enc[:nbuf], 'PACKED': pac_obj})
+
+                nbuf = 0
+
+        if nbuf:
+            pac_obj = np.asarray(batch_pac[:nbuf], dtype=object)
+
+            f[-1].append({'COVPIX': batch_cov[:nbuf], 'ENC': batch_enc[:nbuf], 'PACKED': pac_obj})
+
+
+def _u64_popcount_array(u64_arr):
+    """Return popcount for a numpy uint64 array."""
+    import numpy as _np
+    a = _np.asarray(u64_arr, dtype=_np.uint64)
+    try:
+        return int(_np.bit_count(a).sum())
+    except Exception:
+        lut = _np.array([bin(i).count("1") for i in range(256)], dtype=_np.uint8)
+        return int(lut[a.view(_np.uint8)].sum())
+
+def _packed_dict_popcounts(packed_blocks, max_items=50):
+    """Compute total and per-covpix popcounts for packed_blocks dict."""
+    import numpy as _np
+    covpix = _np.fromiter(packed_blocks.keys(), dtype=_np.int64, count=len(packed_blocks))
+    pcs = []
+    for k in covpix:
+        pcs.append(_u64_popcount_array(packed_blocks[int(k)]))
+    pcs = _np.asarray(pcs, dtype=_np.int64)
+    total = int(pcs.sum())
+    order = _np.argsort(covpix)
+    covpix_s = covpix[order]
+    pcs_s = pcs[order]
+    if len(covpix_s) <= max_items:
+        pairs = ", ".join([f"{int(c)}:{int(p)}" for c, p in zip(covpix_s, pcs_s)])
+    else:
+        pairs = ", ".join([f"{int(c)}:{int(p)}" for c, p in zip(covpix_s[:max_items], pcs_s[:max_items])]) + ", ..."
+    return total, covpix_s, pcs_s, pairs
+
+
+
+def _unpack_packed_block_to_pixels(covpix, packed_words, order, cov_order):
+    """Unpack a single coverage-pixel packed bitset (uint64 words) into global nested pixel IDs at `order`."""
+    import numpy as _np
+    covpix = int(covpix)
+    order = int(order)
+    cov_order = int(cov_order)
+    packed_words = _np.asarray(packed_words, dtype=_np.uint64)
+
+    # Number of subpixels within this coverage pixel at target order
+    nsub = 1 << (2 * (order - cov_order))  # 4^(order-cov_order)
+    nwords = (nsub + 63) // 64
+    if packed_words.size < nwords:
+        # allow shorter buffers: treat missing trailing words as zeros
+        buf = _np.zeros(nwords, dtype=_np.uint64)
+        buf[:packed_words.size] = packed_words
+        packed_words = buf
+    elif packed_words.size > nwords:
+        packed_words = packed_words[:nwords]
+
+    # Find set bits
+    # Fast-ish: for each word, get bit positions
+    idx_words = _np.nonzero(packed_words)[0]
+    if idx_words.size == 0:
+        return _np.empty(0, dtype=_np.int64)
+
+    out = []
+    for wi in idx_words.tolist():
+        w = int(packed_words[wi])
+        # iterate set bits
+        while w:
+            lsb = w & -w
+            b = (lsb.bit_length() - 1)
+            sub = wi * 64 + b
+            if sub < nsub:
+                out.append(sub)
+            w ^= lsb
+
+    if not out:
+        return _np.empty(0, dtype=_np.int64)
+
+    out = _np.asarray(out, dtype=_np.int64)
+    shift = 2 * (order - cov_order)
+    pix = (int(covpix) << shift) | out
+    return pix
+
+
+def _diag_subset_bitpack_vs_mocpy_pixel_diffs(table, colra, coldec, colrad, order, delta_depth, cov_order, gpu_kwargs):
+    """Run subset GPU-bitpack paint vs mocpy on the same subset, then print pixel-level set diffs.
+
+    Focuses on covpix that appear in either result; prints per-covpix counts and samples of only_gpu / only_ref pixels.
+    """
+    import numpy as _np
+    try:
+        from mocpy import MOC as _MOC
+        import astropy.units as _u
+    except Exception as e:
+        print(f"[bitpack-diag] pixdiff mocpy unavailable: {e}")
+        return
+
+    try:
+        import importlib
+        _backend_candidates = [
+            "gpu_pixelize_cones_moclike_v1_11_bitpack_atomic_parentfix_bitpackonly",
+            "gpu_pixelize_cones_moclike_v1_11_bitpack_atomic_parentfix_both",
+            "gpu_pixelize_cones_moclike_v1_11_bitpack_atomic_unitsfix",
+            "gpu_pixelize_cones_moclike_v1_11_bitpack_atomic",
+        ]
+        _mod = None
+        _last_err = None
+        for _mn in _backend_candidates:
+            try:
+                _mod = importlib.import_module(_mn)
+                break
+            except Exception as _e:
+                _last_err = _e
+        if _mod is None:
+            raise _last_err
+        _GpuBitpackDictAccumulator = getattr(_mod, "GpuBitpackDictAccumulator")
+        _accumulate_discs_bitpack = getattr(_mod, "accumulate_discs_bitpack")
+        print(f"[bitpack-diag] pixdiff using backend module: {_mod.__name__}")
+    except Exception as e:
+        print(f"[bitpack-diag] pixdiff bitpack backend unavailable: {e}")
+        return
+
+    n = int(min(len(table), int(gpu_kwargs.get("diag_subset", 5000))))
+    if n <= 0:
+        print("[bitpack-diag] pixdiff skipped: empty subset")
+        return
+
+    ra = _np.asarray(table[colra][:n], dtype=_np.float64)
+    dec = _np.asarray(table[coldec][:n], dtype=_np.float64)
+    rad = _np.asarray(table[colrad][:n], dtype=_np.float64)
+
+    # covpix list for subset (use mocpy at cov_order)
+    try:
+        moc_cov_res = _MOC.from_cones(
+            lon=ra * _u.deg, lat=dec * _u.deg, radius=rad * _u.deg,
+            max_depth=int(cov_order), delta_depth=0
+        )
+    except TypeError:
+        moc_cov_res = _MOC.from_cones(
+            lon=ra * _u.deg, lat=dec * _u.deg, radius=rad * _u.deg,
+            max_depth=int(cov_order)
+        )
+
+    if isinstance(moc_cov_res, (list, tuple)):
+        if len(moc_cov_res) == 0:
+            covpix = _np.empty(0, dtype=_np.int64)
+        else:
+            moc_cov = moc_cov_res[0]
+            for _m in moc_cov_res[1:]:
+                moc_cov = moc_cov.union(_m) if hasattr(moc_cov, "union") else (moc_cov | _m)
+            _flat = moc_cov.flatten() if callable(getattr(moc_cov, "flatten", None)) else moc_cov.flatten
+            covpix = _np.asarray(_flat, dtype=_np.int64)
+    else:
+        moc_cov = moc_cov_res
+        _flat = moc_cov.flatten() if callable(getattr(moc_cov, "flatten", None)) else moc_cov.flatten
+        covpix = _np.asarray(_flat, dtype=_np.int64)
+
+    covpix = _np.unique(covpix).astype(_np.int64, copy=False)
+    print(f"[bitpack-diag] pixdiff subset_n={n} covpix_n={len(covpix)} covpix={covpix.tolist()[:32]}")
+
+    # Run fresh GPU bitpack accumulator on subset
+    threads_per_block = int(gpu_kwargs.get("threads_per_block", 128))
+    tmp_acc = _GpuBitpackDictAccumulator(order_sparse=int(order), cov_order=int(cov_order))
+
+    _accumulate_discs_bitpack(
+        acc=tmp_acc,
+        ra_deg=ra,
+        dec_deg=dec,
+        radius_deg=rad,
+        order=int(order),
+        delta_depth=int(delta_depth),
+        stream_batch=int(gpu_kwargs.get("stream_batch", 20000)),
+        covpix_list=covpix,
+        threads_per_block=threads_per_block,
+        timing_split=False,
+    )
+
+    # Build GPU pixel set by unpacking blocks for these covpix
+    gpu_pix_list = []
+    for cp in covpix.tolist():
+        blk = tmp_acc.blocks.get(int(cp), None)
+        if blk is None:
+            continue
+        pix = _unpack_packed_block_to_pixels(int(cp), blk, order=order, cov_order=cov_order)
+        if pix.size:
+            gpu_pix_list.append(pix)
+    gpu_pix = _np.unique(_np.concatenate(gpu_pix_list)) if gpu_pix_list else _np.empty(0, dtype=_np.int64)
+
+    # mocpy reference at sparse order
+    try:
+        moc_ref_res = _MOC.from_cones(
+            lon=ra * _u.deg, lat=dec * _u.deg, radius=rad * _u.deg,
+            max_depth=int(order), delta_depth=int(delta_depth)
+        )
+    except TypeError:
+        moc_ref_res = _MOC.from_cones(
+            lon=ra * _u.deg, lat=dec * _u.deg, radius=rad * _u.deg,
+            max_depth=int(order)
+        )
+
+    if isinstance(moc_ref_res, (list, tuple)):
+        if len(moc_ref_res) == 0:
+            ref_pix = _np.empty(0, dtype=_np.int64)
+        else:
+            moc_ref = moc_ref_res[0]
+            for _m in moc_ref_res[1:]:
+                moc_ref = moc_ref.union(_m) if hasattr(moc_ref, "union") else (moc_ref | _m)
+            _flat = moc_ref.flatten() if callable(getattr(moc_ref, "flatten", None)) else moc_ref.flatten
+            ref_pix = _np.asarray(_flat, dtype=_np.int64)
+    else:
+        moc_ref = moc_ref_res
+        _flat = moc_ref.flatten() if callable(getattr(moc_ref, "flatten", None)) else moc_ref.flatten
+        ref_pix = _np.asarray(_flat, dtype=_np.int64)
+
+    ref_pix = _np.unique(ref_pix.astype(_np.int64, copy=False))
+
+    # Set diffs
+    only_gpu = _np.setdiff1d(gpu_pix, ref_pix, assume_unique=True)
+    only_ref = _np.setdiff1d(ref_pix, gpu_pix, assume_unique=True)
+
+    print(f"[bitpack-diag] pixdiff totals gpu={gpu_pix.size} ref={ref_pix.size} only_gpu={only_gpu.size} only_ref={only_ref.size}")
+
+    # Per covpix breakdown for mismatching covpix
+    shift = 2 * (int(order) - int(cov_order))
+    def _per_cov_counts(pix_arr):
+        if pix_arr.size == 0:
+            return {}
+        cov = (pix_arr >> shift).astype(_np.int64, copy=False)
+        u, c = _np.unique(cov, return_counts=True)
+        return {int(k): int(v) for k, v in zip(u, c)}
+
+    cg = _per_cov_counts(gpu_pix)
+    cr = _per_cov_counts(ref_pix)
+    c_og = _per_cov_counts(only_gpu)
+    c_or = _per_cov_counts(only_ref)
+
+    keys = sorted(set(cg.keys()) | set(cr.keys()))
+    for k in keys:
+        print(f"[bitpack-diag] pixdiff covpix {k}: gpu={cg.get(k,0)} ref={cr.get(k,0)} only_gpu={c_og.get(k,0)} only_ref={c_or.get(k,0)}")
+
+    # Sample a few pixels from diffs (global IDs)
+    samp = int(gpu_kwargs.get("diag_sample", 25))
+    if only_gpu.size:
+        print(f"[bitpack-diag] pixdiff only_gpu sample={only_gpu[:samp].tolist()}")
+    if only_ref.size:
+        print(f"[bitpack-diag] pixdiff only_ref sample={only_ref[:samp].tolist()}")
+
+def _packedbool_u8_view(pba):
+    """Best-effort access to the underlying packed uint8 buffer of healsparse._PackedBoolArray.
+
+    We avoid relying on a single private attribute name because it has changed across healsparse
+    versions. If this cannot be obtained, callers should fall back to the slow pixel-list path.
+    """
+    # Common private/public attribute names seen in the wild
+    for name in ("_data", "data", "_arr", "arr", "_array", "_packed", "_bytes", "_buf", "_storage"):
+        if hasattr(pba, name):
+            v = getattr(pba, name)
+            if isinstance(v, np.ndarray) and v.dtype == np.uint8 and v.ndim == 1:
+                return v
+    # Some versions expose a method returning the packed view
+    for name in ("view_uint8", "as_uint8", "packed", "to_uint8"):
+        if hasattr(pba, name):
+            try:
+                v = getattr(pba, name)()
+                if isinstance(v, np.ndarray) and v.dtype == np.uint8 and v.ndim == 1:
+                    return v
+            except Exception:
+                pass
+    return None
+
+
+def _healsparse_from_packed_dict_slow(packed_blocks: dict[int, np.ndarray], *,
+                                     nside_cov: int, nside_spa: int,
+                                     bit_packed: bool = True,
+                                     verbose: bool = False) -> "hsp.HealSparseMap":
+    """Slow-but-portable finalize: expand bitpacks to pixel IDs then update_values_pix()."""
+    nside_cov = int(nside_cov)
+    nside_spa = int(nside_spa)
+    if nside_spa % nside_cov != 0:
+        raise ValueError("nside_sparse must be a multiple of nside_coverage (NESTED).")
+    ratio = nside_spa // nside_cov
+    nfine = ratio * ratio  # fine pixels per coverage pixel
+
+    out = hsp.HealSparseMap.make_empty(
+        nside_coverage=nside_cov,
+        nside_sparse=nside_spa,
+        dtype=np.bool_,
+        bit_packed=True,
+    )
+
+    if not packed_blocks:
+        return out
+
+    # Large streaming buffer of pixel IDs to update
+    per_worker_buffer_cap = 12_000_000
+    buf = np.empty(per_worker_buffer_cap, dtype=np.int64)
+    bpos = 0
+
+    def _update_map(pix):
+        try:
+            out.update_values_pix(pix, True, operation="replace")
+        except TypeError:
+            if not hasattr(_update_map, "_ones") or _update_map._ones.size < pix.size:
+                _update_map._ones = np.ones(pix.size, dtype=np.bool_)
+            out.update_values_pix(pix, _update_map._ones[:pix.size], operation="replace")
+
+    def flush():
+        nonlocal bpos
+        if bpos:
+            _update_map(buf[:bpos])
+            bpos = 0
+
+    # Iterate in covpix order for determinism
+    for cv in sorted(int(k) for k in packed_blocks.keys()):
+        row_u64 = np.asarray(packed_blocks[cv], dtype=np.uint64)
+        if row_u64.size == 0:
+            continue
+        packed_u8 = row_u64.view(np.uint8)
+        if packed_u8.size == 0:
+            continue
+
+        need = int(_sum_popcount_u8(packed_u8))
+        if need == 0:
+            continue
+
+        base = int(cv) * int(nfine)
+
+        # Stream single huge rows directly if needed
+        if need > buf.size:
+            w = 0
+            w = _expand_bitpack_row(base, packed_u8, buf, w)
+            if w:
+                _update_map(buf[:w])
+            continue
+
+        if bpos + need > buf.size:
+            flush()
+
+        bpos = _expand_bitpack_row(base, packed_u8, buf, bpos)
+
+    flush()
+
+    if bit_packed:
+        try:
+            out = out.as_bit_packed_map()
+        except Exception:
+            pass
+
+    if verbose:
+        try:
+            print(f"[gpu_bitpack] slow finalize covpix={len(packed_blocks)} valid_pix={int(out.n_valid)}", flush=True)
+        except Exception:
+            pass
+
+    return out
+
+
+def _healsparse_from_packed_dict(packed_blocks: dict[int, np.ndarray], *,
+                                nside_cov: int, nside_spa: int,
+                                bit_packed: bool = True,
+                                verbose: bool = False) -> "hsp.HealSparseMap":
+    """Finalize a dict of packed blocks into a HealSparseMap (FAST path).
+
+    This routine writes packed bytes *directly* into healsparse's internal packed-bool storage,
+    avoiding expansion to pixel lists and repeated update_values_pix() calls.
+
+    The packed blocks are interpreted as BITORD='L' (LSB-first) within each byte, matching
+    healsparse's packed-boolean convention for bit-packed maps.
+
+    Falls back to a slow-but-portable finalize if the healsparse packed buffer cannot be accessed.
+    """
+    nside_cov = int(nside_cov)
+    nside_spa = int(nside_spa)
+    if nside_spa % nside_cov != 0:
+        raise ValueError("nside_sparse must be a multiple of nside_coverage (NESTED).")
+
+    if not packed_blocks:
+        return hsp.HealSparseMap.make_empty(
+            nside_coverage=nside_cov,
+            nside_sparse=nside_spa,
+            dtype=np.bool_,
+            bit_packed=True,
+        )
+
+    covpix = np.asarray(sorted(int(k) for k in packed_blocks.keys()), dtype=np.int64)
+
+    out = hsp.HealSparseMap.make_empty(
+        nside_coverage=nside_cov,
+        nside_sparse=nside_spa,
+        dtype=np.bool_,
+        bit_packed=True,
+        cov_pixels=covpix,
+    )
+
+    # Access the underlying packed-byte array from healsparse
+    pba = out._sparse_map
+    dst_u8 = _packedbool_u8_view(pba)
+    if dst_u8 is None:
+        # Can't access packed bytes in this healsparse build -> fall back
+        return _healsparse_from_packed_dict_slow(
+            packed_blocks,
+            nside_cov=nside_cov,
+            nside_spa=nside_spa,
+            bit_packed=bit_packed,
+            verbose=verbose,
+        )
+
+    nfine = int(out._cov_map.nfine_per_cov)
+    if (nfine % 8) != 0:
+        raise ValueError("bit-packed finalize requires nfine_per_cov to be a multiple of 8.")
+    nbytes_per_cov = nfine // 8
+
+    # Fast bulk copy: for each covpix, compute the destination byte offset and memcpy the row bytes.
+    for cv in covpix.tolist():
+        row_u64 = np.asarray(packed_blocks[int(cv)], dtype=np.uint64)
+        if row_u64.size == 0:
+            continue
+        src_u8 = row_u64.view(np.uint8)
+        if src_u8.size != nbytes_per_cov:
+            # Be conservative: accept larger rows but only take the first nbytes_per_cov.
+            if src_u8.size < nbytes_per_cov:
+                raise ValueError(f"Packed block for covpix={cv} has {src_u8.size} bytes; expected {nbytes_per_cov}.")
+            src_u8 = src_u8[:nbytes_per_cov]
+
+        # Compute the sparse-map *bit* start for this covpix block:
+        # block_start_bits = covpix*nfine + cov_map[covpix]
+        # (see HealSparseMap memory layout: idx = ipnest + cov_map[covpix(ipnest)])
+        block_start_bits = int(cv) * nfine + int(out._cov_map[int(cv)])
+        byte_start = block_start_bits // 8
+        dst_u8[byte_start: byte_start + nbytes_per_cov] = src_u8
+
+    # Invalidate cached valid-count; healsparse will recompute on demand.
+    try:
+        out._n_valid = None
+    except Exception:
+        pass
+
+    if verbose:
+        try:
+            # n_valid recomputation can be expensive; print coverage size only.
+            print(f"[gpu_bitpack] fast finalize covpix={covpix.size}", flush=True)
+        except Exception:
+            pass
+
+    return out
+
 def getarea_moc(moc: "MOC") -> float:
     """
     Get the area of a MOC in deg^2
@@ -580,7 +1137,7 @@ class SkyMaskPipe:
     _SCALAR_ATTRS = ["order_cov", "order_out"]
     _BITPACK_FITS_VERSION = 1   # File format version in case we update
 
-    
+
     def __init__(self, **kwargs):
         # Default values for orders, when not provided
         self.order_out = kwargs.get('order_out', 15)
@@ -677,8 +1234,8 @@ class SkyMaskPipe:
     __repr__ = __str__
     ###########################
 
-    
-    def _finalize_stage(self, hspmap, *, default_name: str, output_stage: Optional[str] = None, 
+
+    def _finalize_stage(self, hspmap, *, default_name: str, output_stage: Optional[str] = None,
                         extra_meta: Optional[dict] = None):
         """Attach a  map as a stage and record standardized metadata. Overwrite canonical when output_stage is None."""
         # extra_meta : pass here the dict associated to the map that you want to store/updata
@@ -709,12 +1266,12 @@ class SkyMaskPipe:
         self._params[name] = meta
         return hspmap
 
-    
+
     def stage_meta(self, name: str) -> dict:
         """Return the metadata associated to a given stage"""
         return dict(self._params.get(name, {}))
 
-    
+
     def stage_orders(self, name: str):
         """Return the (order_sparse, order_coverage) of a given stage"""
         import math
@@ -967,7 +1524,7 @@ class SkyMaskPipe:
 
 
     @staticmethod
-    def filter_and_pixelate_patches(file: str | os.PathLike[str], qatable : Table, 
+    def filter_and_pixelate_patches(file: str | os.PathLike[str], qatable : Table,
                                     filt: Optional[str] = None, order : int = 13) -> NDArray[np.int64]:
         """
         Reads a file with HSC patches, matches it against the QA table containing quality measures
@@ -1108,13 +1665,15 @@ class SkyMaskPipe:
 
 
     @staticmethod
-    def pixelate_circles(data: Union[pd.DataFrame, str, os.PathLike[str]], stage : HealSparseMap, fmt: str = "ascii", 
-                         columns: Sequence[str] = ("ra", "dec", "radius"), order: int = 15, delta_depth: int = 2, 
-                         n_threads: int = 1, chunk_size: int = 600_000) -> None:
+    def pixelate_circles(data: Union["pd.DataFrame", str, os.PathLike], stage: Optional[hsp.HealSparseMap],
+        fmt: str = "ascii", columns: Sequence[str] = ("ra", "dec", "radius"), order: int = 15,
+        delta_depth: int = 2, n_threads: int = 1, chunk_size: int = 600_000, use_gpu: bool = False,
+        gpu_kwargs: Optional[Dict[str, Any]] = None, finalize_gpu: bool = False ) -> Optional[hsp.HealSparseMap]:
+
+        """Pixelize many circles and update `stage` (CPU) or a GPU bitpack accumulator (GPU).
+        Radii are interpreted as degrees.
         """
-        Pixelize many circles into HEALPix indices and update the corresponding 
-        pixels of a given input stage.
-        """
+
         colra, coldec, colrad = columns
         if isinstance(data, pd.DataFrame):
             table = data
@@ -1125,41 +1684,192 @@ class SkyMaskPipe:
         else:
             raise TypeError("data must be a DataFrame or path")
 
-        print(f'    Order :: {order} | pixelization_threads={n_threads}')
+        if use_gpu:
+            print(f'    Order :: {order} | Pixelizer :: GPU')
+        else:
+            print(f'    Order :: {order} | Pixelizer :: CPU  | pixelization_threads={n_threads}')
         n_total = len(table)
         print(f'    Circles to pixelate: {n_total} in batches of {chunk_size}')
 
-        for start in range(0, n_total, chunk_size):
-            end = min(start + chunk_size, n_total)
-            print(f'        processing circles {start}:{end} ...')
+        if n_total == 0: return stage  # do we need this????
 
+        # ================================================================================
+        # ===== GPU branch ===============================================================
+        if use_gpu:
+            from skykatana.gpu_pixelizers import is_gpu_available, GpuBitpackDictAccumulator, accumulate_discs_bitpack
+
+            if not is_gpu_available():
+                raise RuntimeError("GPU pixelization requested, but CUDA GPU support is not available.")
+
+            gkw = dict(gpu_kwargs or {})
+            from time import perf_counter
+            _timing = bool(gkw.get("timing_split", False))
+            if _timing:
+                _t0_total = perf_counter()
+                _t_cov = 0.0
+                _t_paint = 0.0
+                _t_fin = 0.0
+            stream_batch = int(gkw.get("stream_batch", 20000))
+            threads_per_block = int(gkw.get("threads_per_block", 128))
+            group_by_covpix = bool(gkw.get("group_by_covpix", True))
+            keep_on_gpu = bool(gkw.get("keep_on_gpu", True))
+            benchmark_mode = bool(gkw.get("benchmark_mode", False))
+            _bench_ms_total = 0.0
+            _bench_batches = 0
+
+            # coverage order is required when stage is None (streaming pipeline)
+            if "cov_order" in gkw:
+                cov_order = int(gkw["cov_order"])
+            elif stage is not None:
+                cov_order = int(round(math.log2(stage.nside_coverage)))
+            else:
+                raise ValueError("GPU mode requires gpu_kwargs['cov_order'] when stage is None.")
+
+            bp_acc = gkw.get("bitpack_accumulator", None)
+            if bp_acc is None:
+                bp_acc = GpuBitpackDictAccumulator(order_sparse=int(order), cov_order=int(cov_order))
+                gkw["bitpack_accumulator"] = bp_acc
+
+            # Stream in chunks
+            for start in range(0, n_total, int(chunk_size)):
+                end = min(n_total, start + int(chunk_size))
+                print(f'        processing circles {start}:{end} ...')
+
+                ra_chunk = np.asarray(table[colra][start:end], dtype=np.float64)
+                dec_chunk = np.asarray(table[coldec][start:end], dtype=np.float64)
+                rad_chunk = np.asarray(table[colrad][start:end], dtype=np.float64)
+
+                covpix_list = gkw.get("covpix_list", None)
+                if covpix_list is None:
+                    # Derive a safe coverage superset at cov_order for allocation
+                    # mocpy expects lon/lat arrays, not a SkyCoord instance
+                    if _timing: _t0 = perf_counter()
+                    m_cov = MOC.from_cones(
+                        lon=Longitude(ra_chunk, unit="deg"),
+                        lat=Latitude(dec_chunk, unit="deg"),
+                        radius=rad_chunk * u.deg,
+                        max_depth=int(cov_order),
+                        delta_depth=0,
+                        union_strategy="small_cones",
+                    )
+                    covpix_list = np.asarray(m_cov.flatten(), dtype=np.int64)
+                    if _timing: _t_cov += perf_counter() - _t0
+
+                if _timing: _t0 = perf_counter()
+                accumulate_discs_bitpack(
+                    acc=bp_acc,
+                    ra_deg=ra_chunk,
+                    dec_deg=dec_chunk,
+                    radius_deg=rad_chunk,
+                    order=int(order),
+                    delta_depth=int(delta_depth),
+                    stream_batch=int(stream_batch),
+                    covpix_list=np.asarray(covpix_list, dtype=np.int64),
+                    threads_per_block=int(threads_per_block),
+                    group_by_covpix=bool(group_by_covpix),
+                    keep_on_gpu=bool(keep_on_gpu),
+                    benchmark_mode=bool(benchmark_mode),
+                    timing_split=bool(_timing),
+                )
+                if benchmark_mode:
+                    _bench_ms_total += float(getattr(bp_acc, "kernel_ms_total", 0.0))
+                    _bench_batches += int(getattr(bp_acc, "kernel_batches", 0))
+                if _timing: _t_paint += perf_counter() - _t0
+                gc.collect()
+
+            # Return a HealSparseMap only if asked to finalize
+            if finalize_gpu:
+                nside_cov = 1 << int(cov_order)
+                nside_spa = 1 << int(order)
+                bit_packed = bool(gkw.get("bit_packed", True))
+                if _timing: _t0 = perf_counter()
+                out_map = _healsparse_from_packed_dict(bp_acc.blocks, nside_cov=nside_cov, nside_spa=nside_spa,
+                                                    bit_packed=bit_packed, verbose=bool(gkw.get("finalize_verbose", False)))
+                if _timing:
+                    _t_fin += perf_counter() - _t0
+                    _t_total = perf_counter() - _t0_total
+                    try:
+                        _npix = int(out_map.n_valid)
+                    except Exception:
+                        _npix = -1
+                    print(f"[gpu timing] covpix_superset={_t_cov:.6f}s  paint={_t_paint:.6f}s  finalize={_t_fin:.6f}s  total={_t_total:.6f}s  npix={_npix}")
+                    # Detailed paint-stage breakdown (populated by gpu_pixelizer when timing_split=True)
+                    _bt = getattr(bp_acc, 'timing', {}) or {}
+                    if _bt:
+                        _fmt_keys = [
+                            ('t_group_sort','group_sort'),
+                            ('t_cov2row_h2d','cov2row+h2d'),
+                            ('t_alloc_bitpack','alloc_bitpack'),
+                            ('t_seed_cpu','seed_cpu'),
+                            ('t_vec_cpu','vec_cpu'),
+                            ('t_minmax_gpu','minmax_gpu'),
+                            ('t_h2d_meta','h2d_meta'),
+                            ('t_alloc_checks_buf','alloc_checkbuf'),
+                            ('t_kernel','kernel'),
+                            ('t_d2h_bitpack','d2h_bitpack'),
+                            ('t_or_cpu','or_cpu'),
+                            ('t_checks','checks'),
+                        ]
+                        parts = []
+                        for k, lab in _fmt_keys:
+                            if k in _bt:
+                                parts.append(f"{lab}={_bt[k]:.6f}s")
+                        if parts:
+                            print("[gpu timing paint-breakdown] " + "  ".join(parts))
+                        _ct = getattr(bp_acc, 'timing_counts', {}) or {}
+                        if _ct:
+                            # avoid super long prints; keep the key counts only
+                            _cones = _ct.get('cones_total', None)
+                            _covn = _ct.get('covpix_total', None)
+                            _kb = _ct.get('kernel_batches', None)
+                            msg = []
+                            if _cones is not None: msg.append(f"cones_total={_cones}")
+                            if _covn is not None: msg.append(f"covpix_total={_covn}")
+                            if _kb is not None: msg.append(f"kernel_batches={_kb}")
+                            if msg:
+                                print("[gpu timing counts] " + "  ".join(msg))
+
+                    if benchmark_mode:
+                        if _bench_batches > 0:
+                            print(f"[gpu benchmark] kernel_ms_total={_bench_ms_total:.3f}  kernel_ms_per_batch={(_bench_ms_total/_bench_batches):.3f}  batches={_bench_batches}")
+                        else:
+                            print(f"[gpu benchmark] kernel_ms_total={_bench_ms_total:.3f}  batches={_bench_batches}")
+                return out_map
+
+            # Keep accumulator in gpu_kwargs dict so callers can reuse it
+            if gpu_kwargs is not None:
+                gpu_kwargs["bitpack_accumulator"] = bp_acc
+            return stage
+
+        # ================================================================================
+        # ===== CPU branch ===============================================================
+        #if stage is None:
+        #    raise ValueError("CPU mode requires `stage` to be a HealSparseMap.")
+
+        for start in range(0, n_total, chunk_size):
+            end = min(n_total, start+chunk_size)
+            print(f'        processing circles {start}:{end} ...')
             mocs = MOC.from_cones(
-                lon=Longitude(table[colra][start:end], unit='deg'),
-                lat=Latitude(table[coldec][start:end], unit='deg'),
-                radius=Angle(table[colrad][start:end], unit='deg'),
-                max_depth=order, delta_depth=delta_depth, n_threads=n_threads, union_strategy="small_cones")
+                lon=Longitude(np.asarray(table[colra][start:end]), unit="deg"),
+                lat=Latitude(np.asarray(table[coldec][start:end]), unit="deg"),
+                radius=np.asarray(table[colrad][start:end]) * u.deg,
+                max_depth=order, delta_depth=delta_depth, n_threads=n_threads,
+                union_strategy="small_cones")
 
             # Small_cones already returns a single MOC for all stars
-            hp_idx = np.array(mocs.flatten()).astype(np.int64)
-
-            ##if not mocs: continue
-            #hp_idx = np.concatenate([moc.flatten() for moc in mocs])
-            ##if not hp_idx: continue
-            #hp_idx = np.unique(hp_idx).astype(np.int64)
-
+            pix = np.asarray(mocs.flatten(), dtype=np.int64)
             # Stream directly into the sparse map
-            stage.update_values_pix(hp_idx, True)
-
-            # be nice with memory
-            del hp_idx, mocs
+            if pix.size: stage.update_values_pix(pix, True)
+            # Be nice with memory
+            del pix, mocs
             gc.collect()
 
-        return
+        return None
 
-    
+
     @staticmethod
-    def pixelate_ellipses(data: Union[pd.DataFrame, str, os.PathLike[str]], fmt: str = "ascii", 
-                          columns: Sequence[str] = ("ra", "dec", "a", "b", "pa"), 
+    def pixelate_ellipses(data: Union[pd.DataFrame, str, os.PathLike[str]], fmt: str = "ascii",
+                          columns: Sequence[str] = ("ra", "dec", "a", "b", "pa"),
                           order: int = 15, delta_depth: int = 2) -> NDArray[np.int64]:
         """
         Read elliptical regions around extended sources, pixelize them and return the (unique)
@@ -1204,10 +1914,10 @@ class SkyMaskPipe:
         print('    done')
         return np.unique(hp_index).astype(np.int64)
 
- 
+
     @staticmethod
-    def pixelate_boxes(data: Union[pd.DataFrame, str, os.PathLike[str]], fmt: str = "ascii", 
-                       columns: Sequence[str] = ("ra_c", "dec_c", "width", "height"), 
+    def pixelate_boxes(data: Union[pd.DataFrame, str, os.PathLike[str]], fmt: str = "ascii",
+                       columns: Sequence[str] = ("ra_c", "dec_c", "width", "height"),
                        order: int = 15, n_threads: int = 4):
         """
         Read box regions around bright stars, pixelize them and return the (unique) pixels inside.
@@ -1259,11 +1969,11 @@ class SkyMaskPipe:
         hp_index = np.concatenate([moc.flatten() for moc in mocs])
         print('    done')
         return np.unique(hp_index).astype(np.int64)
-    
+
 
     @staticmethod
-    def pixelate_zones(data: Union[pd.DataFrame, str, os.PathLike[str]], fmt: str = "ascii", 
-                       columns: Sequence[str] = ("ra1", "dec1", "ra2", "dec2"), 
+    def pixelate_zones(data: Union[pd.DataFrame, str, os.PathLike[str]], fmt: str = "ascii",
+                       columns: Sequence[str] = ("ra1", "dec1", "ra2", "dec2"),
                        order: int = 15) -> NDArray[np.int64]:
         """
         Read zone regions, pixelize them and return the (unique) pixels inside. Zones are
@@ -1315,10 +2025,10 @@ class SkyMaskPipe:
         print('    done')
         return hp_index
 
-    
+
 
     @staticmethod
-    def pixelate_polys(data: Union[pd.DataFrame, str, os.PathLike[str]], fmt: str = "ascii", 
+    def pixelate_polys(data: Union[pd.DataFrame, str, os.PathLike[str]], fmt: str = "ascii",
                        columns: Sequence[str] = ("ra0", "ra1", "ra2", "ra3", "dec0", "dec1", "dec2", "dec3"),
                        n_threads: int = 4, order: int = 15) -> NDArray[np.int64]:
         """
@@ -1376,10 +2086,12 @@ class SkyMaskPipe:
 
 
 
-    def build_star_mask_online(self, starq, order_sparse: int = 15, order_cov: Optional[int] = None,
-                               columns: Optional[Sequence[str]] = ['ra','dec','radius'], save_stars: bool = False,
-                               bit_packed: bool = True, n_threads: int = 4, chunk_size: int = 600_000, 
-                               output_stage: Optional[str] = None, mwmask_output_stage: Optional[str] = None):
+    def build_star_mask_online(self, starq: Dict[str, Any], pixelizer: str = "cpu",
+        gpu_kwargs: Optional[Dict[str, Any]] = None, order_sparse: int = 15,
+        order_cov: Optional[int] = None, columns: Optional[Sequence[str]] = ['ra','dec','radius'],
+        save_stars: bool = False, bit_packed: bool = True, n_threads: int = 1,
+        chunk_size: int = 600_000, output_stage: Optional[str] = None,
+        mwmask_output_stage: Optional[str] = None):
         """
         Build a bright-star mask on the fly by querying a remote catalog.
 
@@ -1388,7 +2100,7 @@ class SkyMaskPipe:
         (2) querying the Gaia catalog in chunks of sky defined by a MOC,
         (3) applying a custom radius function to compute star exclusion radii,
         (4) pixelizing the stars into HEALPix pixels at the requested order,
-        and (5) streaming results directly into a sparse mask. By default, the 
+        and (5) streaming results directly into a sparse mask. By default, the
         final mask is stored in the `starmask` attribute.
 
         Parameters
@@ -1396,19 +2108,23 @@ class SkyMaskPipe:
         starq : dict
             Dictionary of parameters controlling the star mask construction.
             Required keys:
-            
-              - ``search_stage`` : `HealSparseMap` defining the search region.
-              - ``cat`` : catalog identifier to open with `lsdb.open_catalog`.
-              - ``columns`` : list of columns to load from the Gaia catalog.
-              - ``gaia_gmag_lims`` : tuple ``(gmin, gmax)`` magnitude limits.
-              - ``radfunction`` : callable that takes a DataFrame and assigns radii to stars.
-              
+
+                - ``search_stage`` : `HealSparseMap` defining the search region.
+                - ``cat`` : catalog identifier to open with `lsdb.open_catalog`.
+                - ``columns`` : list of columns to load from the Gaia catalog.
+                - ``gaia_gmag_lims`` : tuple ``(gmin, gmax)`` magnitude limits.
+                - ``radfunction`` : callable that takes a DataFrame and assigns radii to stars.
+                - ``avoid_mw`` : bool, if True subtract a Milky Way disc+bulge MOC from the search region.
+                - ``b0_deg`` : float, Galactic latitude half-thickness (deg) for the disc mask (used when ``avoid_mw``).
+                - ``bulge_a_deg`` : float, bulge semi-major axis (deg) (used when ``avoid_mw``).
+                - ``bulge_b_deg`` : float, bulge semi-minor axis (deg) (used when ``avoid_mw``).
+
             Optional keys:
-            
-              - ``max_area_single`` : maximum deg² before splitting (default 500).
-              - ``target_chunk_area`` : target deg² per MOC chunk (default 300).
-              - ``coarse_order_bfs`` : order for initial chunk splitting (default 5).
-              
+
+                - ``max_area_single`` : maximum deg² before splitting (default 800).
+                - ``target_chunk_area`` : target deg² per MOC chunk (default 800).
+                - ``coarse_order_bfs`` : order for initial chunk splitting (default 5).
+
         order_sparse : int, optional
             Sparse order for pixelizing circles due to stars.
         order_cov : int, optional
@@ -1417,25 +2133,58 @@ class SkyMaskPipe:
             Column names expected in the star DataFrame. Defaults to
             ``['ra', 'dec', 'radius']``.
         save_stars : bool, default=False
-            If True, for each chunk piece save the retrieved stars (with radius column) in parquet format
+            If True, for each chunk piece save the retrieved stars (with radius column) in parquet format.
         bit_packed : bool, optional
             If True, convert the final mask to bit-packed format.
         n_threads : int, default=4
-            Number of threads used during circle pixelization.
+            Number of threads used during circle pixelization (CPU pixelizer only).
         chunk_size : int, default=600000
-            Number circles pixelized at once. Watch out memory if chunk_size and n_threads are both large
+            Number circles pixelized at once. Watch out memory if chunk_size and n_threads are both large.
+        pixelizer : {"cpu", "gpu"}, default "cpu"
+            Pixelization backend. When "cpu", uses the default CPU/mocpy route.
+            When "gpu", uses the v07 GPU bitpack painter (CUDA required).
+        gpu_kwargs : dict, optional
+            Extra keyword arguments used only when `pixelizer="gpu"`. Supported keys include:
+
+            - ``stream_batch`` : int, default 20000
+                Number of stars/discs processed per streamed batch on the GPU.
+            - ``threads_per_block`` : int, default 128
+                CUDA threads per block for the paint kernel.
+            - ``group_by_covpix`` : bool, default True
+                If True, group discs by coverage pixel to improve locality and reduce overhead.
+            - ``keep_on_gpu`` : bool, default True
+                If True, keep intermediate buffers on the GPU across streamed batches.
+            - ``cov_order`` : int
+                Coverage order used by the GPU accumulator when operating in streaming mode.
+                (Internally set from `order_cov` by the caller in normal usage.)
+            - ``covpix_list`` : array-like of int
+                Optional coverage-pixel superset at ``cov_order`` used to pre-allocate rows for each MOC chunk.
+                If not provided, a superset is derived from the current chunk MOC.
+            - ``timing_split`` : bool, default False
+                If True, collect and print detailed timing breakdown (allocation, transfers, kernel, etc.).
+            - ``benchmark_mode`` : bool, default False
+                If True, record kernel timing counters on the accumulator for profiling.
+            - ``bit_packed`` : bool, default True
+                Controls packing when finalizing a GPU accumulator into a HealSparseMap (if applicable).
+            - ``finalize_verbose`` : bool, default False
+                Verbosity flag for GPU finalization helper (if applicable in the current call path).
+            - ``bitpack_accumulator`` : GpuBitpackDictAccumulator
+                Optional accumulator to reuse across chunks/tiles (advanced use). If not provided,
+                a new one is created internally.
+
         output_stage : str, optional
-            Name for the star ouput stage. If None, defaults to then canonical name 'starmask'
+            Name for the star output stage. If None, defaults to then canonical name 'starmask'.
         mwmask_output_stage : str, optional
-            Name for the Milky Way disc+bulge stage. If None, defaults to the canonical name "mkmask"
+            Name for the Milky Way disc+bulge stage. If None, defaults to the canonical name "mkmask".
 
         Returns
         -------
         starmask : healsparse.HealSparseMap
-            The star mask as a `HealSparseMap`, also stored as `self.starmask` when `output_stage` is None
+            The star mask as a `HealSparseMap`, also stored as `self.starmask` when `output_stage` is None.
         """
-        # from lsdb.core.search.moc_search import MOCSearch   # this was for lsdb 0.6.4
-        from lsdb.core.search.region_search import MOCSearch  # important import!
+
+        # Import here to keep module import light when not used
+        from lsdb.core.search.region_search import MOCSearch
 
         print('BUILDING STAR MASK >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
         if not(isinstance(starq, dict)): raise Exception("starq must be a valid dictionary")
@@ -1446,8 +2195,15 @@ class SkyMaskPipe:
         nside_sparse = 1<<order_sparse
         nside_cov = 1<<ord_cov
 
-        # Create the empty boolean map up front
-        mask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_, bit_packed=True)
+        pixelizer = str(pixelizer).lower()
+        use_gpu = (pixelizer == "gpu")
+        gpu_kwargs = dict(gpu_kwargs or {}) if use_gpu else {}
+        if use_gpu:
+            gpu_kwargs.setdefault("cov_order", int(ord_cov))
+            gpu_kwargs.setdefault("bit_packed", bool(bit_packed))
+
+        #  # Create the empty boolean map up front. In GPU mode we don't create the output map until finalize
+        mask = None if use_gpu else hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_, bit_packed=bool(bit_packed))
 
         MAX_DEPTH = 8     # The moc of the search_stage will be degraded to this order.
                           # 8 means 822" pixels, so is fine for including stars with up to ~411" radii
@@ -1460,11 +2216,12 @@ class SkyMaskPipe:
         moc = MOC.from_healpix_cells(ipix=search_stage.valid_pixels, depth=order_search_stg, max_depth=MAX_DEPTH)
 
         # Create moc for the Milky Way at MAX_DEPTH and subtract
-        avoid_mw = starq['avoid_mw']
-        b0_deg = starq['b0_deg']
-        bulge_a_deg = starq['bulge_a_deg']
-        bulge_b_deg = starq['bulge_b_deg']
+        avoid_mw = bool(starq.get("avoid_mw", False))
+        b0_deg = float(starq.get("b0_deg", 0.0))
+        bulge_a_deg = float(starq.get("bulge_a_deg", 0.0))
+        bulge_b_deg = float(starq.get("bulge_b_deg", 0.0))
         mwmessage = ''
+        #moc_pb = None
         if avoid_mw:
             print('--- Avoid Milky Way is ON')
             moc_pb = SkyMaskPipe.gal_plane_bulge_moc(max_depth=MAX_DEPTH, b0_deg=b0_deg,
@@ -1497,7 +2254,6 @@ class SkyMaskPipe:
             chunk_areas = [getarea_moc(mi) for mi in chunk_mocs]
             print(f"Got {len(chunk_mocs)} chunks of areas [{' '.join(f'{a:6.2f}' for a in chunk_areas)}] deg²")
 
-
         # Star radii function
         radfunction = starq['radfunction']
         if not callable(radfunction):
@@ -1517,11 +2273,27 @@ class SkyMaskPipe:
                 s.to_parquet(fn)
                 print('---',fn, 'written to disk')
             # Pixelate this moc_chunk
-            self.pixelate_circles(s, mask, order=order_sparse, columns=columns,
-                                  n_threads=n_threads, chunk_size=chunk_size)
+            if use_gpu:
+                gpu_kwargs["covpix_list"] = _moc_to_covpix_list(mi, ord_cov)
+                self.pixelate_circles(
+                    s, stage=None, order=order_sparse, columns=columns, chunk_size=chunk_size,
+                    use_gpu=True, gpu_kwargs=gpu_kwargs, finalize_gpu=False)
+            else:
+                self.pixelate_circles(
+                    s, mask, order=order_sparse, columns=columns, n_threads=n_threads,
+                    chunk_size=int(chunk_size), use_gpu=False)
             # Free memory promptly
             del s
             gc.collect()
+
+        # Finalize GPU accumulation and populate output healsparse mask
+        if use_gpu:
+            bp_acc = gpu_kwargs.get("bitpack_accumulator", None)
+            if bp_acc is None:
+                mask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_, bit_packed=bool(bit_packed))
+            else:
+                mask = _healsparse_from_packed_dict(bp_acc.blocks, nside_cov=nside_cov, nside_spa=nside_sparse,
+                    bit_packed=bool(bit_packed), verbose=bool(gpu_kwargs.get("finalize_verbose", False)))
 
         # Save mask for Milky Way is case the user might need to subtract it later
         if avoid_mw:
@@ -1542,17 +2314,20 @@ class SkyMaskPipe:
                                            # storing the actual map. We should fix this later
 
         if 'mwmask' in locals() and mwmask is not None:
-            extra_meta = { 'b0_deg': b0_deg, 'bulge_a_deg': bulge_a_deg, 'buge_b_deg': bulge_b_deg, 
+            extra_meta = { 'b0_deg': b0_deg, 'bulge_a_deg': bulge_a_deg, 'buge_b_deg': bulge_b_deg,
                            'pixels': npix, 'area_deg2': area_deg2 }
             self._finalize_stage(mwmask, default_name='mwmask', output_stage=mwmask_output_stage, extra_meta=extra_meta);
 
-        extra_meta = { 'starq': starq, 'columns': columns, 'bit_packed': bit_packed, 'n_threads': n_threads, 
-                       'chunk_size': chunk_size, 'avoid_mw': avoid_mw, 'b0_deg': b0_deg, 'bulge_a_deg': bulge_a_deg, 
-                       'bulge_b_deg': bulge_b_deg, 'pixels': npix, 'area_deg2': area_deg2 }
+        # Do not store the bitpack_accumulator. Should we store the covpix list?
+        extra_meta = { 'starq': starq, 'columns': columns, 'bit_packed': bit_packed, 'n_threads': n_threads,
+                       'chunk_size': chunk_size, 'avoid_mw': avoid_mw, 'b0_deg': b0_deg, 'bulge_a_deg': bulge_a_deg,
+                       'bulge_b_deg': bulge_b_deg, 'pixels': npix, 'area_deg2': area_deg2,
+                       'use_gpu': use_gpu, 'gpu_kwargs': {k: v for k, v in gpu_kwargs.items() if k != "bitpack_accumulator"}}
         return self._finalize_stage(mask, default_name='starmask', output_stage=output_stage, extra_meta=extra_meta)
 
 
-        
+
+
 
     @staticmethod
     def reproject_nside_coverage(hspmap, newcov):
@@ -1578,7 +2353,7 @@ class SkyMaskPipe:
         return new_map
 
 
-    def build_prop_mask(self, prop_maps, thresholds, comparisons, order_sparse: int = 15, order_cov=None, 
+    def build_prop_mask(self, prop_maps, thresholds, comparisons, order_sparse: int = 15, order_cov=None,
                         bit_packed=False, output_stage: Optional[str] = None):
         """
         Build a HealSparse boolean mask based on pixels meeting multiple property map thresholds
@@ -1595,7 +2370,7 @@ class SkyMaskPipe:
             If True, return the ouput as bit-packed boolean map
         output_stage : str, optional
             Name for the ouput stage. If None, defaults to then canonical name 'propmask'
-            
+
         Returns
         -------
         mask_map : HealSparseMap
@@ -1668,11 +2443,11 @@ class SkyMaskPipe:
 
             if len(pixels) == 0:
                 raise ValueError(f"0 pixels remaining after condition {i} ({comparison} {threshold})")
-        
+
         # Build combined mask using geometry from the first map, i.e. prop_maps[0].nside_coverage
         mask = hsp.HealSparseMap.make_empty(prop_maps[0].nside_coverage, prop_maps[0].nside_sparse, dtype=np.bool_)
         mask[pixels] = True
-        
+
         # Change to desired coverage order. This honors the input keyword parameter, which itself defaults
         # to the pipeline value (order_cov) when not specified
         if nside_cov != prop_maps[0].nside_coverage:
@@ -1685,7 +2460,7 @@ class SkyMaskPipe:
         if nside_sparse != prop_maps[0].nside_sparse:
             print(f'--- Propertymap sparse order changed to {order_sparse}')
             mask = self.change_sparse_order(mask, order_sparse, inplace=True, verbose=False)
-        
+
         # Force packing if desired
         if bit_packed: mask = mask.as_bit_packed_map()
 
@@ -1693,7 +2468,7 @@ class SkyMaskPipe:
         area_deg2 = mask.get_valid_area(degrees=True)
         npix = mask.n_valid
         print('--- Propertymap mask area                       :', area_deg2)
-        extra_meta = { 'prop_maps': pmstring, 'thresholds': thresholds, 'comparisons': comparisons, 
+        extra_meta = { 'prop_maps': pmstring, 'thresholds': thresholds, 'comparisons': comparisons,
                        'bit_packed': bit_packed, 'pixels': npix, 'area_deg2': area_deg2 }
         return self._finalize_stage(mask, default_name='propmask', output_stage=output_stage, extra_meta=extra_meta)
 
@@ -1720,7 +2495,7 @@ class SkyMaskPipe:
             If True, return the ouput as bit-packed boolean map
         output_stage : str, optional
             Name for the ouput stage. If None, defaults to then canonical name 'patchmask'
-            
+
         Returns
         -------
         hsp_map
@@ -1740,7 +2515,7 @@ class SkyMaskPipe:
         nside_sparse = 1<<order_sparse
         nside_cov = 1<<ord_cov
 
-        
+
         # Read patch qa list
         qatable = self.readQApatches(qafile)
 
@@ -1758,10 +2533,10 @@ class SkyMaskPipe:
         area_deg2 = mask.get_valid_area(degrees=True)
         npix = mask.n_valid
         print('--- Patch mask area                           :', area_deg2)
-        extra_meta = { 'patchfile': patchfile, 'qafile': qafile, 'filt': filt, 'bit_packed': bit_packed, 
+        extra_meta = { 'patchfile': patchfile, 'qafile': qafile, 'filt': filt, 'bit_packed': bit_packed,
                        'pixels': npix, 'area_deg2': area_deg2 }
         return self._finalize_stage(mask, default_name='patchmask', output_stage=output_stage, extra_meta=extra_meta)
-    
+
 
 
     @staticmethod
@@ -1835,7 +2610,7 @@ class SkyMaskPipe:
 
     def build_foot_mask(self, sources, *, order_sparse: int = 13, order_cov: Optional[int] = None,
                         columns: Iterable[str] = ("ra", "dec"), remove_isopixels: bool = False,
-                        erode_borders: bool = False, mapping: bool = False, bit_packed: bool = False, 
+                        erode_borders: bool = False, mapping: bool = False, bit_packed: bool = False,
                         output_stage: Optional[str] = None):
         """
         Create a footprint mask of a source catalog (from any astropy-supported table or HATS catalog),
@@ -1860,7 +2635,7 @@ class SkyMaskPipe:
             If True, return the ouput as bit-packed boolean map
         output_stage : str, optional
             Name for the ouput stage. If None, defaults to then canonical name 'footmask'
-            
+
         Returns
         -------
         healsparse.HealSparseMap
@@ -1904,14 +2679,14 @@ class SkyMaskPipe:
         else:
             sources_string = "<mem>"                             # fallback when input from mem
         print('--- Foot mask area                         :', area_deg2)
-        extra_meta = { 'sources': sources_string, 'columns': columns, 'remove_isopixels': remove_isopixels, 
+        extra_meta = { 'sources': sources_string, 'columns': columns, 'remove_isopixels': remove_isopixels,
                        'erode_borders': erode_borders, 'bit_packed': bit_packed, 'pixels': npix, 'area_deg2': area_deg2 }
         return self._finalize_stage(mask, default_name='footmask', output_stage=output_stage, extra_meta=extra_meta)
 
 
 
     @staticmethod
-    def intersect_boolmask(mask1 : HealSparseMap, mask2 : HealSparseMap, 
+    def intersect_boolmask(mask1 : HealSparseMap, mask2 : HealSparseMap,
                            bit_packed: Optional[bool] = None) -> HealSparseMap:
         """
         Intersect two arbitrary boolean masks in healsparse format.
@@ -1948,7 +2723,7 @@ class SkyMaskPipe:
 
 
     @staticmethod
-    def subtract_boolmask(mask1 : HealSparseMap, mask2 : HealSparseMap, 
+    def subtract_boolmask(mask1 : HealSparseMap, mask2 : HealSparseMap,
                           bit_packed: Optional[bool] = None) -> HealSparseMap:
         """
         Subtract two arbitrary boolean masks in healsparse format.
@@ -2154,7 +2929,7 @@ class SkyMaskPipe:
 
 
 
-    def apply(self, stage : str ='mask', cat: Union[pd.DataFrame, Table, None] = None, 
+    def apply(self, stage : str ='mask', cat: Union[pd.DataFrame, Table, None] = None,
               columns: Sequence[str] = ("ra", "dec"), file: Optional[str] = None) -> Union[pd.DataFrame, Table]:
         """
         Apply a mask to a catalog (DataFrame/Astropy_Table) and optionally save it to disk.
@@ -2500,12 +3275,12 @@ class SkyMaskPipe:
 
 
 
-    def plot_moc(self, stage: Union[HealSparseMap, str], center: Optional[SkyCoord] = None, 
-                 fov: Optional[Angle] = None, clipra: Optional[tuple[float, float]] = None, 
+    def plot_moc(self, stage: Union[HealSparseMap, str], center: Optional[SkyCoord] = None,
+                 fov: Optional[Angle] = None, clipra: Optional[tuple[float, float]] = None,
                  clipdec: Optional[tuple[float, float]] = None, order_force: Optional[int] = None,
                  frame: str = "icrs", projection: str = "SIN", figsize: tuple[float, float] = (10.0, 5.0),
                  color: str = "green", alpha: float = 0.2, linewidth: float = 1.0, label: Optional[str] = None,
-                 ax: Optional[Axes] = None, wcs: Optional[WCS] = None, show: bool = False, 
+                 ax: Optional[Axes] = None, wcs: Optional[WCS] = None, show: bool = False,
                  stream_pars: Optional[dict[str, object]] = None) -> tuple[Figure, Axes, WCS]:
         """
         Plot a MOC version of a given stage or healsparse map. Optionally clip pixels outside
@@ -2614,16 +3389,16 @@ class SkyMaskPipe:
         if show: plt.show()
         return fig, ax, wcs
 
-    
+
     @staticmethod
-    def frac_area_map(hsp_in: hsp.HealSparseMap, order_frac: int = 8, avg_edges: bool = False, 
-                      edge_value_max: float | None = None, 
+    def frac_area_map(hsp_in: hsp.HealSparseMap, order_frac: int = 8, avg_edges: bool = False,
+                      edge_value_max: float | None = None,
                       grow_k: int = 1, max_iters: int = 600, tol: float = 1e-4) -> hsp.HealSparseMap:
         """
         Compute the fractional area map of a healsparse map at a target HEALPix order. Optionally
         apply a harmonic averaging step to remove the artificial low-fraction ring of pixels at
         the footprint boundary.
-                
+
         Parameters
         ----------
         hsp_in : healsparse.HealSparseMap
@@ -2631,21 +3406,21 @@ class SkyMaskPipe:
         order_frac : int, default=8
             Order at which to compute the fractional coverage. Larger ``order_frac`` means finer pixels.
         avg_edges : bool, default=False
-            If ``True``, post-process the fractional map to correct the systematically low values 
-            that appear along the outer edge. Only a narrow **edge band**  (valid coarse pixels that 
+            If ``True``, post-process the fractional map to correct the systematically low values
+            that appear along the outer edge. Only a narrow **edge band**  (valid coarse pixels that
             touch any UNSEEN neighbor) is modified. All interior pixels remain fixed.
         edge_value_max : float or None, default=None
-            When ``avg_edges=True``, restrict pixel changes to edge pixels whose initial fractional 
+            When ``avg_edges=True``, restrict pixel changes to edge pixels whose initial fractional
             value is **≤ edge_value_max** (e.g., 0.15–0.30). Use this to target the undercounted pixels
             only. If ``None``, modify the entire edge band regardless of value.
         grow_k : int, default=1
-            Grow the inpaint region inward by this many HEALPix **k-rings** from the detected edge 
+            Grow the inpaint region inward by this many HEALPix **k-rings** from the detected edge
             (0 = only the immediate edge ring).
         max_iters : int, default=600
-            Maximum Gauss–Seidel iterations for the harmonic averaging on the HEALPix neighbor graph 
+            Maximum Gauss–Seidel iterations for the harmonic averaging on the HEALPix neighbor graph
             (each updated pixel becomes the mean of its finite neighbors).
         tol : float, default=1e-4
-            Convergence threshold on the maximum absolute change within the averaging region between 
+            Convergence threshold on the maximum absolute change within the averaging region between
             iterations. Iterations stop early when the change drops below this value.
 
         Returns
@@ -2660,18 +3435,18 @@ class SkyMaskPipe:
             print(f'Fractions at edge pixels are being averaged')
             nside = int(frac_hsp.nside_sparse)
             npix  = 12 * nside * nside
-        
+
             # Dense NEST HEALPix array
             arr_hp = frac_hsp.generate_healpix_map(nside=nside, nest=True).astype(float)
             valid  = arr_hp != hp.UNSEEN
             arr    = np.where(valid, arr_hp, np.nan)
-        
+
             if not np.any(valid): return frac_hsp.copy()
-        
+
             # Neighbors: shape (8, npix), with -1 where no neighbor
             pix   = np.arange(npix, dtype=np.int64)
             neigh = hp.get_all_neighbours(nside, pix, nest=True)
-        
+
             # Find the edge ring: valid pixel with at least one UNSEEN neighbor
             has_unseen_neighbor = np.zeros(npix, dtype=bool)
             for i in range(8):
@@ -2679,13 +3454,13 @@ class SkyMaskPipe:
                 m = nb >= 0
                 # Neighbor is "unseen" if not valid there
                 has_unseen_neighbor[m] |= ~valid[nb[m]]
-        
+
             edge0 = valid & has_unseen_neighbor
-        
+
             # Optionally restrict to low-valued edge pixels
             if edge_value_max is not None:
                 edge0 &= (arr <= float(edge_value_max))
-        
+
             # Grow inward by k-rings within the valid domain
             inpaint = edge0.copy()
             for _ in range(int(grow_k)):
@@ -2696,14 +3471,14 @@ class SkyMaskPipe:
                     # any neighbor in current inpaint band?
                     touch[m] |= inpaint[nb[m]]
                 inpaint |= (valid & touch)
-        
+
             # Fixed (Dirichlet) set: all valid pixels not in the inpaint band
             fixed = valid & ~inpaint
-        
+
             # If no unknown pixels (or no anchors), just return original
             idx_unknown = np.flatnonzero(inpaint)
             if idx_unknown.size == 0 or not np.any(fixed):  return frac_hsp.copy()
-        
+
             # Initialize unknowns with neighbor means
             out = arr.copy()
             def neighbor_mean_for_unknowns(values, idx_unknown, neigh):
@@ -2713,7 +3488,7 @@ class SkyMaskPipe:
                 for i in range(8):
                     nb = neigh[i, idx_unknown]     # neighbors of each unknown pixel
                     m  = nb >= 0
-                    if not np.any(m): 
+                    if not np.any(m):
                         continue
                     vals = values[nb[m]]
                     f = np.isfinite(vals)
@@ -2724,10 +3499,10 @@ class SkyMaskPipe:
                 ok = counts > 0
                 mean[ok] = sums[ok] / counts[ok]
                 return mean
-        
+
             init = neighbor_mean_for_unknowns(out, idx_unknown, neigh)
             out[idx_unknown] = np.where(np.isfinite(init), init, out[idx_unknown])
-        
+
             # Gauss–Seidel harmonic updates on the inpaint band
             for _ in range(int(max_iters)):
                 old = out[idx_unknown].copy()
@@ -2738,7 +3513,7 @@ class SkyMaskPipe:
                 delta = np.nanmax(np.abs(out[idx_unknown] - old))
                 if not np.isfinite(delta) or delta < tol:
                     break
-        
+
             # Clip to [0,1] and convert back to HealSparse
             out = np.clip(out, 0.0, 1.0)
             hp_arr = np.where(np.isfinite(out), out, hp.UNSEEN)
@@ -2747,12 +3522,12 @@ class SkyMaskPipe:
             except TypeError:
                 frac_hsp = hsp.HealSparseMap.convert_healpix_map(hp_arr, nside_coverage=frac_hsp.nside_coverage, nest=True)
 
-        
+
         print(f'Fractional area map created at order {order_frac}: {frac_hsp.n_valid} valid pixels')
         return frac_hsp
 
-        
-    
+
+
     def plot_fracmap(self, stage: Union[HealSparseMap, str], order_frac: int = 8, ax=None, wcs=None,
         center: SkyCoord | None = None, fov: Angle | None = None,
         frame: str = "icrs", projection: str = "SIN", figsize: tuple[float, float] = (10.0, 5.0),
@@ -2771,7 +3546,7 @@ class SkyMaskPipe:
         """
         Render a **fractional area map** for a pipeline stage or healsparse map and display it on WCS axes,
         optionally overlaying one or more isocontours. Works in two modes:
-        
+
         Parameters
         ----------
         stage : healsparse.HealSparseMap or str
@@ -2779,7 +3554,7 @@ class SkyMaskPipe:
         order_frac : int, optional
             HEALPix order to compute the coarse fractional map. Larger orders give finer pixels. Default is 8.
         ax, wcs : matplotlib.axes._axes.Axes, mocpy.moc.WCS, optional
-            When both are supplied, the function overlays the image onto the provided WCS view. If either 
+            When both are supplied, the function overlays the image onto the provided WCS view. If either
             is `None`, a new figure is create at `center`+`fov`.
         center : astropy.coordinates.SkyCoord, optional
             Sky center for **Create mode**. Must be provided when `ax`/`wcs` are not.
@@ -2797,12 +3572,12 @@ class SkyMaskPipe:
             Matplotlib colormap name. If `None`, MPL default is used.
         alpha : float, optional
             Opacity of the fractional image layer. Default 1.0.
-        order : {'nearest-neighbor','bilinear'}. Use `'nearest-neighbor'` for mask-like maps and `'bilinear'` 
+        order : {'nearest-neighbor','bilinear'}. Use `'nearest-neighbor'` for mask-like maps and `'bilinear'`
             for softer display. Default 'nearest-neighbor'.
         thresholds : float or sequence of float, optional
             One or more fraction levels (e.g., `0.3`, or `[0.3, 0.5, 0.7]`) to draw as contours.
         contour_smooth : dict or None, optional
-            Optional smoothing for the contours. Supported method is 
+            Optional smoothing for the contours. Supported method is
             `{'method': 'gaussian', 'sigma_pix': <float>}` where `sigma_pix` is the Gaussian
             sigma in **display pixels** (typ. 1–3). If `None`, no smoothing is applied.
         contour_kwargs : dict or None, optional
@@ -2819,9 +3594,9 @@ class SkyMaskPipe:
         colorbar : bool, optional
             If `True`, attach a colorbar. Default True.
         avg_edges : bool, optional
-            If `True`, the fractional map produced is post-processed with a harmonic averaging that 
+            If `True`, the fractional map produced is post-processed with a harmonic averaging that
             fixes the the artificial low-fraction of boundary pixels. Default False.
-        
+
         Returns
         -------
         fig : matplotlib.figure.Figure
@@ -2835,7 +3610,7 @@ class SkyMaskPipe:
         CS : matplotlib.contour.QuadContourSet or None
             The contour set, if `thresholds` were provided; otherwise `None`.
         """
-        
+
         # Choose stage based on input healsparse map or the name of stage in a pipeline
         if hasattr(stage, 'valid_pixels'):
             stage = stage
@@ -2846,7 +3621,7 @@ class SkyMaskPipe:
         frac_map = SkyMaskPipe.frac_area_map(stage, order_frac=order_frac, avg_edges=avg_edges)
         #frac_map = stage.fracdet_map(2**order_frac)
         #print(f'Fractional area map created at order {order_frac}: {frac_map.n_valid} valid pixels')
-        
+
         # Create axes/wcs or take from the input keyworks ------------------------
         created_context = False
         if (ax is None) or (wcs is None):
@@ -2866,21 +3641,21 @@ class SkyMaskPipe:
                 created_context = True
         else:
             fig = ax.figure
-    
+
         # Get the header from mocpy WCS and compute nx,ny from CRPIX1&2 -----------
         hdr = wcs.to_header()
         nx = int(round(2.0 * float(hdr['CRPIX1'])))
         ny = int(round(2.0 * float(hdr['CRPIX2'])))
-        
+
         # Get rid of UNSEEN values and reproject -----------------------------------
         vals = frac_map.generate_healpix_map(nside=frac_map.nside_sparse, nest=True).astype(float)
         vals[vals == hp.UNSEEN] = np.nan
         arr, _ = reproject_from_healpix((vals, 'icrs'), ax.wcs, shape_out=(ny, nx), nested=True, order=order )
-    
+
         # Draw image --------------------------------------------------------------
         im = ax.imshow(arr, origin='lower', vmin=vmin, vmax=vmax, cmap=cmap,
                        alpha=alpha, zorder=zorder_img)
-    
+
         # Draw contours  ----------------------------------------------------------
         CS = None
         if thresholds is not None:
@@ -2889,14 +3664,14 @@ class SkyMaskPipe:
             else:
                 levels = [float(t) for t in thresholds]
             levels = sorted({t for t in levels if np.isfinite(t)})
-    
+
             ck = dict(zorder=zorder_contour)
             if contour_kwargs:
                 ck.update(contour_kwargs)
-    
+
             arr_for = np.array(arr, copy=True)
             finite = np.isfinite(arr_for)
-    
+
             method = (contour_smooth or {}).get('method', None)
             if method in (None, 'gaussian'):
                 if method == 'gaussian':
@@ -2906,10 +3681,10 @@ class SkyMaskPipe:
                     num = gaussian_filter(a0,  sigma=sigma_pix, mode='nearest')
                     den = gaussian_filter(wgt, sigma=sigma_pix, mode='nearest')
                     arr_for = np.where(den > 0, num/den, np.nan)
-    
+
                 masked = np.ma.array(arr_for, mask=~finite)
                 CS = ax.contour(masked, levels=levels, **ck)
-    
+
                 if contour_label:
                     fmt = contour_label if isinstance(contour_label, str) else 'f={level:.2f}'
                     fmt_map = {lvl: fmt.format(level=lvl) for lvl in levels}
@@ -2924,15 +3699,15 @@ class SkyMaskPipe:
                         pass
             else:
                 raise ValueError(f"Unknown contour_smooth method: {method!r}")
-    
+
         if colorbar:
             cb = plt.colorbar(im, ax=ax, pad=0.02)
             cb.set_label('masked fraction')
-    
+
         # Return everything in case the user need to keep plotting
         return fig, ax, wcs, im, CS
 
-        
+
 
     @staticmethod
     def add_moca(alwidget, stage: Union[HealSparseMap, str], color: str = "red", opacity: float = 0.25,
@@ -2957,7 +3732,7 @@ class SkyMaskPipe:
         rows_per_batch : int, optional
             Number of coverage rows to process per batch when building the MOC. Higher values can reduce overhead but use more memory. Default is ``2048``.
         order_forced : int, optional
-            If provided, forces the generated MOC to be degraded this HEALPix order before adding it to the widget. Default is ``None``, 
+            If provided, forces the generated MOC to be degraded this HEALPix order before adding it to the widget. Default is ``None``,
             which keeps the native sparse order.
 
         Returns
@@ -2994,8 +3769,8 @@ class SkyMaskPipe:
             ) from e
 
 
-    def plot_moca(self, stage: Union[HealSparseMap, str], color: str = "red", opacity: float = 0.25, 
-                  colormap: str = "viridis", target: str = "268 -26", fov: float = 120.0, 
+    def plot_moca(self, stage: Union[HealSparseMap, str], color: str = "red", opacity: float = 0.25,
+                  colormap: str = "viridis", target: str = "268 -26", fov: float = 120.0,
                   survey: str = "CDS/P/DM/I/355/gaiadr3", order_forced: Optional[int] = None):
         """
         Create an ipyaladin widget, load a HiPS survey, overlay a MOC, and set display
@@ -3136,7 +3911,7 @@ class SkyMaskPipe:
 
 
     def combine(self, positive, *, negative=None, order_out: Optional[int] = None,
-                order_cov: Optional[int] = None, bit_packed: bool = True, verbose: bool = True, 
+                order_cov: Optional[int] = None, bit_packed: bool = True, verbose: bool = True,
                 output_stage: Optional[str] = None):
         """
         Combine multiple stage masks into a single mask using logical operations.
@@ -3169,7 +3944,7 @@ class SkyMaskPipe:
             stage orders, and final statistics.
         output_stage : str, optional
             Name for the ouput stage. If None, defaults to then canonical name 'mask'
-            
+
         Returns
         -------
         mask : healsparse.HealSparseMap
@@ -3508,8 +4283,8 @@ class SkyMaskPipe:
         return self._finalize_stage(res, default_name='mask', output_stage=output_stage, extra_meta=extra_meta)
 
 
-    
-    def change_sparse_order(self, stage: Union[str, HealSparseMap], order: int, *, inplace: bool = True, 
+
+    def change_sparse_order(self, stage: Union[str, HealSparseMap], order: int, *, inplace: bool = True,
                             verbose: bool = True) -> HealSparseMap:
         """
         Change the sparse resolution for a boolean (or bit-packed boolean) stage or HealSparseMap,
@@ -3583,7 +4358,7 @@ class SkyMaskPipe:
         return out
 
 
-    def change_cov_order(self, stage: Union[str, HealSparseMap], order: int, *, inplace: bool = True, 
+    def change_cov_order(self, stage: Union[str, HealSparseMap], order: int, *, inplace: bool = True,
                          verbose: bool = True):
         """
         Change coverage order (nside_coverage) while preserving sparse resolution and bitpacking
@@ -3648,17 +4423,18 @@ class SkyMaskPipe:
 
         return out
 
-    
 
-    def build_circ_mask(self, data: Union[pd.DataFrame, str, Path] = None, order_sparse: int = 15,
-            order_cov: Optional[int] = None, fmt: str = 'ascii', columns: Optional[Sequence[str]] = ['ra','dec','radius'],
-            bit_packed: bool = False, n_threads: int = 4, chunk_size: int = 600_000, output_stage: Optional[str] = None):
 
+    def build_circ_mask(self, data: Union["pd.DataFrame", str, Path] = None, order_sparse: int = 15,
+                        order_cov: Optional[int] = None, fmt: str = "ascii",
+                        columns: Sequence[str] = ("ra", "dec", "radius"), bit_packed: bool = False,
+                        n_threads: int = 4, chunk_size: int = 600_000, output_stage: Optional[str] = None,
+                        pixelizer: str = "cpu", gpu_kwargs: Optional[Dict[str, Any]] = None):
         """
         Build a mask from input circle data and store it as a HealSparse boolean map.
 
         Each input row describes a circle in the sky, defined as [ra_center, dec_center, radius]
-        in degrees, whera ra_center,dec_center are the center coordinates. The circles are
+        in degrees, where ra_center,dec_center are the center coordinates. The circles are
         pixelized at `order_sparse` to produce the set of HEALPix pixels covering it.
 
         Parameters
@@ -3668,60 +4444,101 @@ class SkyMaskPipe:
             in `columns`. If a path (string or Path), it is read according
             to `fmt` (delegated to astropy).
         order_sparse : int, optional
-            Sparse order to pixelize the circles
+            Sparse order to pixelize the circles.
         order_cov : int, optional
-            Coverage order. If None, falls back to `self.order_cov`
+            Coverage order. If None, falls back to `self.order_cov`.
         fmt : str, default "ascii"
             File format used when `data` is a path (e.g., "ascii", "parquet",
-            "csv", or any format supported by the astropy readers)
+            "csv", or any format supported by the astropy readers).
         columns : sequence of str, optional
             Columns for the center coordinates and radius. If None, defaults
-            to ["ra", "dec", "radius"]`
+            to ["ra", "dec", "radius"].
         bit_packed : bool, optional
-            If True, return the ouput as bit-packed boolean map
+            If True, return the output as bit-packed boolean map.
         n_threads : int, default=4
-            Number of threads to use in the pixelization step
+            Number of threads to use in the pixelization step (CPU pixelizer only).
         chunk_size : int, default=600000
-            Number circles pixelized at once. Watch out memory if chunk_size and n_threads are both large
+            Number circles pixelized at once. Watch out memory if chunk_size and n_threads are both large.
+        pixelizer : {"cpu", "gpu"}, default "cpu"
+            Pixelization backend. When "cpu", uses the default CPU/mocpy route.
+            When "gpu", uses the v07 GPU bitpack painter (CUDA required).
+        gpu_kwargs : dict, optional
+            Extra keyword arguments used only when `pixelizer="gpu"`. Supported keys include:
+
+            - ``stream_batch`` : int, default 20000
+                Number of discs processed per streamed batch on the GPU.
+            - ``threads_per_block`` : int, default 128
+                CUDA threads per block for the paint kernel.
+            - ``group_by_covpix`` : bool, default True
+                If True, group discs by coverage pixel to improve locality and reduce overhead.
+            - ``keep_on_gpu`` : bool, default True
+                If True, keep intermediate buffers on the GPU across streamed batches.
+            - ``cov_order`` : int
+                Coverage order used by the GPU accumulator when operating in streaming mode.
+                (Internally set from `order_cov` by the caller in normal usage.)
+            - ``covpix_list`` : array-like of int
+                Optional coverage-pixel superset at ``cov_order`` used to pre-allocate rows.
+                If not provided, a superset is derived from the input circles via mocpy.
+            - ``timing_split`` : bool, default False
+                If True, collect and print detailed timing breakdown (allocation, transfers, kernel, etc.).
+            - ``benchmark_mode`` : bool, default False
+                If True, record kernel timing counters on the accumulator for profiling.
+            - ``bit_packed`` : bool, default True
+                Controls packing when finalizing a GPU accumulator into a HealSparseMap (if applicable).
+            - ``finalize_verbose`` : bool, default False
+                Verbosity flag for GPU finalization helper (if applicable in the current call path).
+            - ``bitpack_accumulator`` : GpuBitpackDictAccumulator
+                Optional accumulator to reuse across calls (advanced use). If not provided,
+                a new one is created internally.
+
         output_stage : str, optional
-            Name for the ouput stage. If None, defaults to then canonical name 'circmask'
-            
+            Name for the output stage. If None, defaults to then canonical name 'circmask'.
+
         Returns
         -------
         HealSparseMap
             The boolean (or bit-packed) mask is stored at `self.circmask` and also
-            returned to prompt
+            returned to prompt.
         """
+
         print('BUILDING CIRCLES MASK >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
         # Check if user wants specific orders, otherwise get from defaults
-        ord_cov = order_cov if order_cov is not None else self.order_cov
+        ord_cov = int(order_cov) if order_cov is not None else int(getattr(self, "order_cov", 4))
 
-        nside_sparse = 1<<order_sparse
-        nside_cov = 1<<ord_cov
+        use_gpu = (str(pixelizer).lower() == "gpu")
+
+        nside_sparse = 1 << int(order_sparse)
+        nside_cov = 1 << int(ord_cov)
 
         # Create the empty boolean map up front
         mask = hsp.HealSparseMap.make_empty(nside_cov, nside_sparse, dtype=np.bool_)
 
+        gkw = dict(gpu_kwargs or {})
+        if use_gpu:
+            gkw.setdefault("cov_order", int(ord_cov))
+
         # Perform pixelization
-        self.pixelate_circles(data, mask, fmt=fmt, order=order_sparse, columns=columns,
-                              n_threads=n_threads, chunk_size=chunk_size)
-        #if pix is not None and len(pix) > 0:
-        #    self.circmask.update_values_pix(pix, True)
+        out = self.pixelate_circles(data, mask, fmt=fmt, order=order_sparse, columns=columns,
+                                    n_threads=n_threads, chunk_size=chunk_size,
+                                    use_gpu=use_gpu, gpu_kwargs=gkw, finalize_gpu=use_gpu)
+
+        if use_gpu and out is not None:  #do we need this??
+            mask = out
 
         # Force packing if desired
         if bit_packed: mask = mask.as_bit_packed_map()
 
-        # Store calling/useful info in its own dictionary
-        area_deg2 = mask.get_valid_area(degrees=True)
-        npix = mask.n_valid
-        print('--- Circles mask area                        :', area_deg2)
-        extra_meta = { 'data': (str(data) if isinstance(data, (str, Path)) else "<mem>"), 'fmt': fmt, 
-                       'columns': columns, 'bit_packed': bit_packed, 'n_threads':n_threads, 
-                       'pixels': npix, 'area_deg2': area_deg2 }
-        return self._finalize_stage(mask, default_name='circmask', output_stage=output_stage, extra_meta=extra_meta)
+        # Store calling/useful info in its own dictionar
+        extra_meta = {
+            "data": (str(data) if isinstance(data, (str, Path)) else "<mem>"), "fmt": fmt,
+            "columns": list(columns), "bit_packed": bool(bit_packed), "n_threads": int(n_threads),
+            "chunk_size": int(chunk_size), "order_sparse": int(order_sparse), "order_cov": int(ord_cov),
+            "pixelizer": pixelizer, "gpu_kwargs": {k: v for k, v in gkw.items() if k != "bitpack_accumulator"},
+            "pixels": int(mask.n_valid), "area_deg2": float(mask.get_valid_area(degrees=True))}
+        return self._finalize_stage(mask, default_name="circmask", output_stage=output_stage, extra_meta=extra_meta)
 
 
-    
+
     def build_box_mask(self, data: Union[pd.DataFrame, str, Path] = None, order_sparse: int = 15,
             order_cov: Optional[int] = None, fmt: str = 'ascii',
             columns: Optional[Sequence[str]] = ['ra_c','dec_c','width','height'],
@@ -3786,12 +4603,12 @@ class SkyMaskPipe:
         area_deg2 = mask.get_valid_area(degrees=True)
         npix = mask.n_valid
         print('--- Boxes mask area                           :', area_deg2)
-        extra_meta = { 'data': (str(data) if isinstance(data, (str, Path)) else "<mem>"), 'fmt': fmt, 
-                       'columns': columns, 'bit_packed': bit_packed, 'n_threads':n_threads, 
+        extra_meta = { 'data': (str(data) if isinstance(data, (str, Path)) else "<mem>"), 'fmt': fmt,
+                       'columns': columns, 'bit_packed': bit_packed, 'n_threads':n_threads,
                        'pixels': npix, 'area_deg2': area_deg2 }
         return self._finalize_stage(mask, default_name='boxmask', output_stage=output_stage, extra_meta=extra_meta)
 
-        
+
 
     def build_ellip_mask(self, data: Union[pd.DataFrame, str, Path] = None, order_sparse: int = 15,
             order_cov: Optional[int] = None, fmt: str = 'ascii',
@@ -3826,7 +4643,7 @@ class SkyMaskPipe:
             If True, return the ouput as bit-packed boolean map
         output_stage : str, optional
             Name for the ouput stage. If None, defaults to then canonical name 'ellipmask'
-            
+
         Returns
         -------
         HealSparseMap
@@ -3856,12 +4673,12 @@ class SkyMaskPipe:
         area_deg2 = mask.get_valid_area(degrees=True)
         npix = mask.n_valid
         print('--- Ellipses mask area                        :', area_deg2)
-        extra_meta = { 'data': (str(data) if isinstance(data, (str, Path)) else "<mem>"), 'fmt': fmt, 
+        extra_meta = { 'data': (str(data) if isinstance(data, (str, Path)) else "<mem>"), 'fmt': fmt,
                        'columns': columns, 'bit_packed': bit_packed, 'pixels': npix, 'area_deg2': area_deg2 }
         return self._finalize_stage(mask, default_name='ellipmask', output_stage=output_stage, extra_meta=extra_meta)
 
 
-    
+
 
     def build_poly_mask(self, data: Union[pd.DataFrame, str, Path] = None, order_sparse: int = 15,
             order_cov: Optional[int] = None, fmt: str = 'ascii',
@@ -3897,7 +4714,7 @@ class SkyMaskPipe:
             Number of threads to use in the pixelization step
         output_stage : str, optional
             Name for the ouput stage. If None, defaults to then canonical name 'polymask'
-            
+
         Returns
         -------
         HealSparseMap
@@ -3927,12 +4744,12 @@ class SkyMaskPipe:
         area_deg2 = mask.get_valid_area(degrees=True)
         npix = mask.n_valid
         print('--- Polygon mask area                           :', area_deg2)
-        extra_meta = { 'data': (str(data) if isinstance(data, (str, Path)) else "<mem>"), 'fmt': fmt, 
-                       'columns': columns, 'bit_packed': bit_packed, 'n_threads':n_threads, 
+        extra_meta = { 'data': (str(data) if isinstance(data, (str, Path)) else "<mem>"), 'fmt': fmt,
+                       'columns': columns, 'bit_packed': bit_packed, 'n_threads':n_threads,
                        'pixels': npix, 'area_deg2': area_deg2 }
         return self._finalize_stage(mask, default_name='polymask', output_stage=output_stage, extra_meta=extra_meta)
 
-    
+
 
     def build_zone_mask(self, data: Union[pd.DataFrame, str, Path] = None,
                         order_sparse: int = 15, order_cov: Optional[int] = None,
@@ -3966,7 +4783,7 @@ class SkyMaskPipe:
             If True, return the ouput as bit-packed boolean map
         output_stage : str, optional
             Name for the ouput stage. If None, defaults to then canonical name 'zonemask'
-            
+
         Returns
         -------
         HealSparseMap
@@ -3999,12 +4816,12 @@ class SkyMaskPipe:
         area_deg2 = mask.get_valid_area(degrees=True)
         npix = mask.n_valid
         print('--- Zones mask area                           :', area_deg2)
-        extra_meta = { 'data': (str(data) if isinstance(data, (str, Path)) else "<mem>"), 'fmt': fmt, 
+        extra_meta = { 'data': (str(data) if isinstance(data, (str, Path)) else "<mem>"), 'fmt': fmt,
                        'columns': columns, 'bit_packed': bit_packed, 'pixels': npix, 'area_deg2': area_deg2 }
         return self._finalize_stage(mask, default_name='zonemask', output_stage=output_stage, extra_meta=extra_meta)
 
 
-        
+
     def build_milkyway_mask(self, order_sparse: int = 8, order_cov: Optional[int] = None,
                             b0_deg: float = 15., bulge_a_deg: float = 25., bulge_b_deg: float = 20.,
                             bit_packed: bool = False, output_stage: Optional[str] = None):
@@ -4027,7 +4844,7 @@ class SkyMaskPipe:
             If True, return the ouput as bit-packed boolean map
         output_stage : str, optional
             Name for the ouput stage. If None, defaults to then canonical name 'mwmask'
-            
+
         Returns
         -------
         HealSparseMap
@@ -4059,11 +4876,11 @@ class SkyMaskPipe:
         area_deg2 = mask.get_valid_area(degrees=True)
         npix = mask.n_valid
         print('--- Milky Way mask area                          :', area_deg2)
-        extra_meta = { 'b0_deg': b0_deg, 'bulge_a_deg': bulge_a_deg, 'buge_b_deg': bulge_b_deg, 
-                       'pixels': npix, 'area_deg2': area_deg2 }        
+        extra_meta = { 'b0_deg': b0_deg, 'bulge_a_deg': bulge_a_deg, 'buge_b_deg': bulge_b_deg,
+                       'pixels': npix, 'area_deg2': area_deg2 }
         return self._finalize_stage(mask, default_name='mwmask', output_stage=output_stage, extra_meta=extra_meta)
 
-        
+
 
     @staticmethod
     def moc_from_stage(stage, order_forced: int | None = None,
@@ -4505,8 +5322,8 @@ class SkyMaskPipe:
 
 
 
-    def makerans(self, stage: Union[str, "HealSparseMap"] = "mask", nr: int = 50_000, 
-                 file: Optional[os.PathLike[str] | str] = None, nside_randoms: int = 2**23, 
+    def makerans(self, stage: Union[str, "HealSparseMap"] = "mask", nr: int = 50_000,
+                 file: Optional[os.PathLike[str] | str] = None, nside_randoms: int = 2**23,
                  rng: Optional[RandomState] = None, **kwargs) -> pd.DataFrame:
         """
         Generate uniform randoms over a HealSparse boolean (or bit-packed) map without materializing

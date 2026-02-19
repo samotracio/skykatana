@@ -14,7 +14,8 @@ bright stars, and apply the mask to an arbitrary catalog to select sources locat
 It has been designed to produce masks for large 8-meter surveys such as the upcoming half-sky 
 dataset of the [Vera Rubin Observatory](https://rubinobservatory.org/) and the [HSC-SSP survey](https://hsc-release.mtk.nao.ac.jp/doc/).
 It can handle multi-billion pixel masks with very limited memory resources and is flexible to 
-accomodate custom recipes for masking different objects.
+accomodate custom recipes for masking different objects.  **Skykatana** also implements a fast
+GPU cone pixelixer algorithm to speed up processing million of stars from large catalogs like Gaia.
 
 Main Class
 -------------
@@ -41,17 +42,61 @@ Dependencies
 * [lsdb](https://github.com/astronomy-commons/lsdb), [healsparse](https://github.com/LSSTDESC/healsparse),
 [tqdm](https://github.com/tqdm/tqdm), [healpy](https://github.com/healpy/healpy), [fitsio](https://github.com/esheldon/fitsio), 
 [ipyaladin](https://github.com/cds-astro/ipyaladin), [pillow](https://github.com/python-pillow/Pillow)
+* Optional GPU pixelizer : [numba](https://numba.pydata.org/) + CUDA , [cupy](https://cupy.dev/)
 
 Install
 -------
-There are two ways to get skykatana:
+### CPU-only (recommended for most users)
 
-* `pip install skykatana`
+Install the latest release with ```pip```:
 
-or 
+```bash
+pip install skykatana
+```
 
-* Clone the repo, switch to the pacakge directory and do `pip install .`&nbsp; This has the advantage that you will
-get the latest version and example notebooks.
+Or install from a local clone (editable mode is convenient for development and notebooks):
+
+```bash
+git clone https://github.com/samotracio/skykatana.git
+cd skykatana
+pip install -e .
+```
+
+### GPU installation (optional)
+
+The GPU pixelizer uses **Numba CUDA + CuPy**. If you have them properly installed you are all set. If not, the most reliable 
+way to install GPU support is via the provided conda environment file, which pins a CUDA runtime/toolchain that is known to work. 
+**Important rule:** the CUDA runtime/toolchain used in your environment must be **<=** the CUDA version supported by your NVIDIA driver.
+
+#### 1) Check your NVIDIA driver and CUDA support
+
+- Run ```nvidia-smi``` and note `Driver Version: ...` and `CUDA Version: X.Y` (this is the maximum CUDA runtime supported by your driver):
+
+- Edit `environment-gpu.yml` and make sure the conda CUDA version is **the same or lower** .
+
+#### 2) Create the GPU conda environment
+
+From the repo root (where `environment-gpu.yml` lives):
+
+```bash
+conda env create -f environment-gpu.yml
+conda activate skykatana-gpu
+```
+
+#### 3) Install Skykatana (editable install)
+
+```bash
+pip install -e .
+```
+GPU Troubleshooting 
+-------------------
+If your conda CUDA environment is newer than the driver (which is often the case), you will get errors like:
+
+- `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`
+- `Unsupported .version 8.8; current version is '8.6'`
+
+Techicaly, this happens because the NVIDIA driver PTX JIT compiler is older than the PTX code that Numba generates. 
+Follow the procedure above until you have matching versions. 
 
 Example Dataset
 ---------------
