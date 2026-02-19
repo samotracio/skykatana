@@ -1,53 +1,205 @@
-
 """
+GPU Pixelizers: mocpy-aligned cone/disc pixelization with direct bit-packed painting
+==================================================================================
 
-Phase 3.2C/3.3 (v06): micro-optimizations in range word-fills to reduce kernel overhead.
+This module implements a GPU pixelization backend for *spherical cones* in the sky,
+designed to reproduce the pixel set produced by:
 
-gpu_pixelize_cones_moclike_v1.py
+    mocpy.MOC.from_cones(..., union_strategy="small_cones")
 
-GPU pixelization of spherical cones (discs on the sky) designed to align with
-mocpy.MOC.from_cones(..., union_strategy="small_cones", delta_depth=2) behavior,
-i.e. cdshealpix::nested::cone_coverage_approx_custom.
+which corresponds to the cdshealpix Rust implementation
+(cd shealpix::nested::cone_coverage_approx_custom) used by mocpy.
 
-Goal
-----
-Return a flat list of NESTED HEALPix pixels at a fixed output order, suitable to
-OR-paint into a HealSparse mask.
+This algorithm generates exactly the same set of NESTED HEALPix pixels but doing it
+efficiently on GPU and by painting the results directly into a bit-packed representation
+compatible with HealSparse/SkyMaskPipe.
 
-Design (v1)
------------
-- Uses the *same* acceptance / overlap / reject decision rule as cdshealpix:
-    shs = sin^2(ad/2) = (1 - dot(u_cell, u_cone))/2
-    compare against per-depth Min/Max computed from
-    largest_center_to_vertex_distances_with_radius(depth_start..depth_eff+1, lon,lat,radius).
+High-level behavior
+-------------------
+Given arrays of cone centers and radii:
 
-- Uses healpy on CPU for:
-    * ang2pix(nest=True) to compute the starting pixel (hash) at depth_start
-    * get_all_neighbours(nest=True) to seed the 9-neighbour set for small cones
+  - ra_deg  : right ascension in degrees
+  - dec_deg : declination in degrees
+  - radius_deg : cone radius in degrees
 
-  This matches standard HEALPix; remaining mismatches (if any) tend to come from
-  floating boundary cases and from the Rust "BMOC packing" lowering. v1 outputs
-  pixels at output order directly, avoiding naive leaf->shift lowering.
+the algorithm returns/accumulates the set of NESTED pixels at a fixed output order
+(`order_sparse`, also called `out_order`) that cover each cone according to the
+cdshealpix “approx_custom” decision rule.
 
-- GPU traversal:
-    One warp per cone; iterative stack; emits:
-      * FULL nodes -> directly expanded / mapped to output order
-      * leaf overlap nodes at depth_eff -> mapped to output order
+Instead of directly returning pixels, this the primary GPU pat *paints* pixels
+into a GPU-resident bit-pack buffer and merges the result into a
+CPU-side accumulator that can later be finalized into a HealSparseMap without ever
+materializing large pixel lists.
 
-Notes
------
-- Selection semantics: ALL (any overlap sets pixel).
-- This module is intended as a drop-in replacement for gpu_pixelize_discs_exact_v2.py
-  from Skykatana wrappers: exports is_gpu_available, GpuBitpackDictAccumulator, accumulate_discs_bitpack.
+Core ideas
+----------
+1) SHS metric (sin^2 half-angle)
+   We work with:
 
-Limitations (explicit)
-----------------------
-- The per-depth bound function is ported from cdshealpix/src/lib.rs, but computed on CPU.
-  Minor numerical differences vs Rust can still occur in rare boundary cases.
-- Large cones (radius >= ~48 deg): falls back to seeding the 12 base cells at depth 0.
-- FULL-node expansion to output order can generate many pixels for very large cones;
-  star masks (arcsec–arcmin) are safe.
+       shs(ad) = sin^2(ad/2) = (1 - dot(u_cell, u_cone)) / 2
 
+   where u_cell is the unit vector of a HEALPix cell center and u_cone is the unit
+   vector for the cone center. This avoids expensive acos() and keeps comparisons
+   numerically stable.
+
+2) mocpy/cdshealpix acceptance rule via per-depth Min/Max thresholds
+   For each depth d in [depth_start .. depth_eff], cdshealpix uses two thresholds
+   derived from the *largest center-to-vertex distance* of a HEALPix cell at that depth,
+   inflated by the cone radius:
+
+     - min_abs[d] : threshold below which the entire cell is guaranteed inside the cone (FULL)
+     - max_abs[d] : threshold below which the cell may overlap the cone (OVERLAP)
+
+   The decision at node (h, d) is:
+
+     - if shs(center(h,d), cone_center) <= min_abs[d] : accept FULL node
+     - elif shs(...) <= max_abs[d] : node overlaps; descend (unless at depth_eff)
+     - else : reject node
+
+   At the maximum traversal depth `depth_eff`, OVERLAP nodes are accepted as leaves,
+   reproducing the cdshealpix “approx_custom” behavior with `delta_depth`.
+
+3) Starting depth + fixed 9-neighbor seeding (cdshealpix fast-start)
+   cdshealpix does not start traversal from depth 0 for small cones. Instead it chooses
+   an initial `depth_start` using a precomputed table (SMALLER_EDGE2OPEDGE_DIST) and
+   seeds traversal with the cone’s center pixel plus its 8 neighbours at that depth:
+
+       seeds = {center_pix} ∪ neighbours(center_pix)
+
+   Large cones are seeded with the 12 base faces at depth 0.
+
+   For performance, this module uses a vectorized healpy-based implementation:
+     - compute depth_start per cone
+     - compute center pixels via healpy.ang2pix(nest=True)
+     - compute neighbours via healpy.get_all_neighbours(nest=True)
+
+4) Depth extension via delta_depth
+   The traversal depth is:
+
+       depth_eff = min(MAX_ORDER_SUPPORTED, out_order + delta_depth)
+
+   which matches mocpy’s `delta_depth` semantics for small_cones.
+
+Dataflow and batching strategy
+------------------------------
+The main entry point is `accumulate_discs_bitpack(...)`. It is designed for streaming:
+
+  A) Precompute per-cone metadata once per call (CPU)
+     - depth_start (int16)
+     - seeds (int64, shape (n, MAX_SEEDS)) and n_seeds (int8)
+     - cone unit vectors (cx, cy, cz)
+     - lon/lat/radius arrays for min/max construction
+
+  B) Upload metadata once (GPU)
+     All metadata is transferred to device arrays exactly once per call.
+
+  C) Build per-cone min/max threshold arrays (GPU)
+     A dedicated CUDA kernel (`build_shs_minmax_abs_kernel`) constructs:
+       - min_abs  : float64, shape (n, depth_eff+1)
+       - max_abs  : float64, shape (n, depth_eff+1)
+
+  D) Process cones in batches (GPU)
+     Cones are processed in batches of `stream_batch` using device slicing (no repeated
+     host<->device transfers of metadata). Each batch paints into a GPU bit-pack buffer.
+
+     Optional locality optimization:
+       - `group_by_covpix=True` sorts cones by their *center coverage pixel* at cov_order.
+         This improves memory locality and reduces covpix row churn.
+
+Bit-packed painting model
+-------------------------
+The GPU painter targets a 2D uint64 buffer:
+
+    bitpack_u64.shape == (n_cov_rows, words_per_cov)
+
+where:
+  - cov_order  : HealSparse coverage order
+  - out_order  : sparse/output order
+  - delta_cov  = out_order - cov_order (must be >= 0)
+  - nfine      = 4^delta_cov fine pixels per coverage pixel at out_order
+  - words_per_cov = ceil(nfine / 64)
+
+Mapping an output pixel `pix` (NESTED index at out_order) to the buffer:
+  - covpix = pix >> (2 * delta_cov)
+  - off    = pix & ((1 << (2 * delta_cov)) - 1)
+  - word   = off >> 6
+  - bit    = off & 63
+  - bitpack_u64[row(covpix), word] |= (1 << bit)
+
+Bit order:
+  - Bits are **LSB-first** within each 64-bit word (BITORD='L'), matching SkyMaskPipe’s
+    and HealSparse packed-boolean conventions.
+
+Painting strategy
+-----------------
+Traversal is performed with a stack-based DFS. For each accepted node:
+
+  - If the node is at depth d >= out_order:
+      map it to out_order by shifting and paint a single bit.
+
+  - If the node is at depth d < out_order:
+      the node covers a contiguous range of out_order pixels:
+          start = h << (2 * (out_order - d))
+          end   = start + 4^(out_order - d) - 1
+      This range is split across coverage pixels and painted using **word-fills**
+      (`_bitpack_or_range`) rather than per-pixel atomics, reducing
+      kernel overhead and atomic pressure for large FULL nodes.
+
+A single CUDA kernel (`paint_cone_pixels_kernel_bitpack_warp`) performs traversal
+and painting. It uses a “one warp per cone” design; in the current implementation
+lane 0 executes the traversal and emits pixel ranges/bits.
+
+Correctness and safety checks
+-----------------------------
+`accumulate_discs_bitpack` requires a `covpix_list` argument: a list of coverage
+pixels (at cov_order) that are allowed / preallocated for the call. Internally a
+dense covpix->row lookup table is built:
+
+    cov2row[covpix] = row_index  or  -1 if missing
+
+If `covpix_list` is not a *superset* of all coverage pixels touched by the cones,
+pixels will be dropped; the kernel records this in `missing_covpix`. Stack overflow
+during traversal is recorded in `overflow`. Both are checked once at the end of the
+call (to avoid per-batch synchronization) and raise RuntimeError if non-zero.
+
+CPU-side accumulation and finalization
+--------------------------------------
+This module does not directly construct a HealSparseMap. Instead it uses
+`GpuBitpackDictAccumulator`, a bridge accumulator:
+
+  - GPU paints produce uint64 blocks for each covpix row.
+  - Blocks are copied to host and OR-merged into:
+        dict[covpix] -> uint64[words_per_cov]
+
+Skykatana provides finalization helpers that can convert this packed-block dict into
+a HealSparseMap:
+  - a fast path that writes directly into healsparse’s packed-bool internal buffers
+  - a slow fallback that expands bits to pixel IDs and uses update_values_pix()
+
+Public API
+----------
+- `is_gpu_available()`:
+    Quick capability check (imports + CUDA device availability).
+
+- `GpuBitpackDictAccumulator(order_sparse, cov_order)`:
+    Holds the packed blocks and supports OR-merging blocks across calls/chunks.
+
+- `accumulate_discs_bitpack(acc, ra_deg, dec_deg, radius_deg, ...)`:
+    Main streaming pixelizer:
+      * builds metadata
+      * computes min/max arrays
+      * traverses and paints into bitpack_u64
+      * merges results into `acc`
+
+Dependencies and requirements
+-----------------------------
+GPU backend requires:
+  - NVIDIA GPU + CUDA driver
+  - numba.cuda
+  - cupy
+  - healpy (used for depth_start + 9-neighbour seeding and some geometry helpers)
+
+All pixel indices are NESTED. The output order must match the accumulator’s order.
 """
 
 import math
@@ -342,7 +494,7 @@ def build_shs_minmax_abs(depth_start: int, depth_eff: int, lon: float, lat: floa
 
 
 # ----------------------------------------------------------------------
-# Phase 3.2D: GPU min/max (per-cone, per-depth) computation
+# GPU min/max (per-cone, per-depth) computation
 # ----------------------------------------------------------------------
 
 # Precompute the cdshealpix per-depth C2V constants once on CPU and expose as
@@ -1077,7 +1229,7 @@ def paint_cone_pixels_kernel_bitpack_warp(
                     bit  = np.uint64(off & np.uint64(63))
                     cuda.atomic.or_(bitpack_u64, (row, word), (np.uint64(1) << bit))
             else:
-                # Phase 3: FULL node range-paint into uint64 word blocks instead of per-pixel atomics
+                # FULL node range-paint into uint64 word blocks instead of per-pixel atomics
                 dd = out_order - d
                 shift = 2 * dd
                 start = np.uint64(h) << np.uint64(shift)
@@ -1233,7 +1385,7 @@ def accumulate_discs_bitpack(
 ):
     """Pixelize cones and paint them into a GPU bitpack buffer, then OR into `acc`.
 
-    Phase 3.2A: reduce per-batch CPU work and host<->device transfers by precomputing
+    This reduces per-batch CPU work and host<->device transfers by precomputing
     per-cone metadata once per call and uploading it once, then slicing device arrays
     for each batch.
 
@@ -1584,7 +1736,7 @@ def _build_seeds_healpy(ra_deg, dec_deg, radius_rad, depth_eff):
     return depth_start, seeds, n_seeds
 
 
-# ---- Phase 3.2B: fixed 9-neighbor seeding (no SHS pre-filter) ----
+# ---- Fixed 9-neighbor seeding (no SHS pre-filter) ----
 # The seed builder below is equivalent to the cdshealpix "center + 8 neighbours" start,
 # but we intentionally skip the expensive Rust-style SHS max pre-filter to reduce CPU overhead.
 _build_seeds_fixed9 = _build_seeds_healpy
