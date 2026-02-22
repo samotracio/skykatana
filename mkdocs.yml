@@ -9,6 +9,7 @@ nav:
   - Healsparse map basics: hspbasic.md
   - HATS & LSDB basics: hatsbasic.md
   - Creating footmasks: creating_footmaps.md
+  - Pixelization with GPU: gpupixelizer.md
   - IO format: io.md
   - API: api.md
 

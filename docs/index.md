@@ -12,7 +12,7 @@ icon: material/page-first
 
 :material-checkbox-multiple-blank-circle-outline: &nbsp; **For each stage you can quickly generate random points, visualize its MOC (Multi-Order Coverage map), overlay catalogs or geometrical shapes, and apply the mask to an arbitrary catalog to restrict to sources located within the mask.**
 
-For creating bright star masks, <span class="sc">SkyKatana</span> has special methods to query and pixelate large online catalogs in HATS/LSDB format (e.g. Gaia), running in systems with limited memory resources. For example, in the Rubin Science Platform (RSP) it can create a completely customized star mask over 5000 deg<sup>2</sup> in just a few minutes. 
+For creating bright star masks, <span class="sc">SkyKatana</span> has special methods to query and pixelate large online catalogs in HATS/LSDB format (e.g. Gaia), running in systems with limited memory resources. For example, in the Rubin Science Platform (RSP) it can create a completely customized star mask over 5000 deg<sup>2</sup> in just a few minutes. Moreover, the code implements an optional GPU pixelator backend for an ever higher level in performance and efficiency.
 
 Although mainly designed to work with the upcoming half-sky dataset of the Vera Rubin Observatory, it is flexible to accomodate the particular details of other surveys such as the the Nancy Grace Roman Telescope, the Subaru HSC-SSP, and most wide-field surveys.  
 

@@ -15,7 +15,7 @@ It has been designed to produce masks for large 8-meter surveys such as the upco
 dataset of the [Vera Rubin Observatory](https://rubinobservatory.org/) and the [HSC-SSP survey](https://hsc-release.mtk.nao.ac.jp/doc/).
 It can handle multi-billion pixel masks with very limited memory resources and is flexible to 
 accomodate custom recipes for masking different objects.  **Skykatana** also implements a fast
-GPU cone pixelixer algorithm to speed up processing million of stars from large catalogs like Gaia.
+GPU cone pixelixer algorithm to speed up processing millions of stars from large catalogs like Gaia.
 
 Main Class
 -------------
@@ -76,10 +76,10 @@ way to install GPU support is via the provided conda environment file, which pin
 
 #### 2) Create the GPU conda environment
 
-From the repo root (where `environment-gpu.yml` lives):
+From the repo root (where `environment-gpu.yaml` lives):
 
 ```bash
-conda env create -f environment-gpu.yml
+conda env create -f environment-gpu.yaml
 conda activate skykatana-gpu
 ```
 

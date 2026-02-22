@@ -41,6 +41,10 @@
 [data-md-color-scheme="slate"] .emph1  {            /* emphasize 1 */  
     color:rgb(255,107,107);
     font-size:1.0em }
+[data-md-color-scheme="slate"] .emph2  {            /* emphasize 2 (for subsectionn titles) */
+    color:rgb(250,250,250);
+    font-weight: bold;
+    font-size:1.0em }
 [data-md-color-scheme="slate"] .mgroup  {            /* group titles in API */  
     color:rgb(254, 228, 134);
     font-size:1.1em }
