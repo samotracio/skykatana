@@ -82,7 +82,12 @@ icon: simple/autoprefixer
         - gal_plane_bulge_moc
         - frac_area_map
         - stage_meta
-        - radfunction_rubin_gaia
+
+::: skykatana.radfunction_rubin_gaia
+    options:
+      show_root_toc_entry: false
+      show_root_heading: true
+      show_docstring_description: true
 
 ## <span class='mgroup'>:material-label-multiple-outline: IO Methods</span>
 <hr class='sep2'>

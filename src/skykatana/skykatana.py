@@ -715,14 +715,14 @@ def radfunction_rubin_gaia(
     valid_range = f"{mag_min:g} < G < {mag_max:g}"
     if extrapolate:
         print(
-            f"rubin_radfunction ({survey}, halo={halo}): "
+            f"radfunction_rubin_gaia ({survey}, halo={halo}): "
             f"extrapolation enabled; evaluated the fit for "
             f"{n_outside} stars outside the validity range "
             f"{valid_range}."
         )
     else:
         print(
-            f"rubin_radfunction ({survey}, halo={halo}): "
+            f"radfunction_rubin_gaia ({survey}, halo={halo}): "
             f"extrapolation disabled; assigned radius=0 to "
             f"{n_outside} stars outside the validity range "
             f"{valid_range}."
