@@ -114,6 +114,25 @@ Large-scale queries might accidentally go deep into the Milky Way plane or bulge
     Note that the stars returned will always follow the search stage minus the galaxy mask, if chosen so, but the search stage in the pipeline remains 
     untouched. Subtract <span class='st'>mwmask</span> from any stage, when needed.
 
+    
+### Radius functions for Gaia stars
+We have included a handy function <span class='met'>radfunction_rubin_gaia()</span> that assigns exclusion radii around Gaia stars, derived from power-law fitting forms calibrated
+with DP1 and with DP2 data. The full methdology is described in [Lopez et al. 2026](https://www.sciencedirect.com/science/article/abs/pii/S2213133726000259) 
+(available also in [arxvix:2512.1448](https://arxiv.org/abs/2512.14848)). 
+
+The function lets you select the survey ("DP1" or "DP2"), band, and choose between the halo/non-halo versions. Check the function docstring for argument details.
+
+**Notes :**
+
+
+* DP1 "halo" coefficients reproduce the triple power-law fits of Table 2 of the paper. They correspond to the 85% completeness level of sources
+with up to u=23.75, g=25, r=25, i=25, z=24.2 or y=23. They are strictly valid within 9<G_gaia<21
+
+* DP1 "non-halo" coefficients reproduce the single power-law fits of Table 3 of the paper. They correspond to the 85% completeness level of sources
+with up to u=25.39, g=27.38, r=27.12, i=26.53, z=25.67 or y=23.77. They are strictly valid within 9<G_gaia<21
+
+* DP2 "non-halo" coefficients are for the 90% completeness level of sources with up to i=24.1. They are strictly valid within 3<G_gaia<21
+
 
 ## 3. Search stars, construct its mask and plot
 Before searching, we should start the Dask client to set the number of workers and memory resources.

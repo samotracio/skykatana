@@ -561,6 +561,176 @@ def split_moc_into_chunks(moc: MOC,
     return out
 
 
+def radfunction_rubin_gaia(
+    df,
+    *,
+    survey="DP1",
+    band="r",
+    halo=False,
+    mag_column="phot_g_mean_mag",
+    extrapolate=True,
+):
+    """Assign Rubin bright-star exclusion radii from Gaia G magnitudes.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Star catalogue. Adds or replaces ``radius`` in place.
+    survey : {"DP1", "DP2"}, default "DP1"
+        Dataset used to calibrate the radius relation.
+    band : str, default "r"
+        Rubin band. Input magnitudes are always Gaia G magnitudes.
+    halo : bool, default False
+        DP1: select Table 2 (halo) or Table 3 (no halo).
+        DP2: only False is supported.
+    mag_column : str, default "phot_g_mean_mag"
+        Column containing finite Gaia G magnitudes.
+    extrapolate : bool, default True
+        Evaluate the fit outside its validity range when True.
+        Otherwise assign zero radius outside that range.
+        Validity ranges are strictly 9 < G < 21 for DP1 and
+        3 < G < 21 for DP2. Print the behavior and affected count.
+
+    Returns
+    -------
+    numpy.ndarray
+        Radii in degrees, which also gets assigned to ``df["radius"]``.
+
+    Notes
+    -----
+    Each relation has the functional form R = A * exp(B * G).
+
+    DP1 "halo" coefficients reproduce the triple power-law fits of Table 2 in
+    arXiv:2512.14848v2. They correspond to the 85% completeness level of sources
+    with up to u=23.75, g=25, r=25, i=25, z=24.2 or y=23
+    They are strictly valid within 9<G_gaia<21
+
+    DP1 "non-halo" coefficients reproduce the single power-law fits of Table 3 in
+    arXiv:2512.14848v2. They correspond to the 85% completeness level of sources
+    with up to u=25.39, g=27.38, r=27.12, i=26.53, z=25.67 or y=23.77
+    They are strictly valid within 9<G_gaia<21
+
+    DP2 "non-halo" coefficients are for the 90% completeness level of sources with up to i=24.1.
+    They are strictly valid within 3<G_gaia<21
+    """
+    survey = str(survey).strip().upper()
+    band = str(band).strip().lower()
+
+    if survey not in {"DP1", "DP2"}:
+        raise ValueError("survey must be 'DP1' or 'DP2'.")
+    if not isinstance(halo, (bool, np.bool_)):
+        raise TypeError("halo must be a boolean.")
+    if not isinstance(extrapolate, (bool, np.bool_)):
+        raise TypeError("extrapolate must be a boolean.")
+
+    if survey == "DP1":
+        mag_min, mag_max = 9.0, 21.0
+
+        if halo:
+            # Table 2: ((A1, B1), (A2, B2), (A3, B3)).
+            fits = {
+                "u": (
+                    (2997.055, -0.192),
+                    (3297263555.368, -1.210),
+                    (579.537, -0.173),
+                ),
+                "g": (
+                    (9283.754, -0.359),
+                    (251355.534, -0.600),
+                    (1139.957, -0.241),
+                ),
+                "r": (
+                    (11960.396, -0.387),
+                    (91530.480, -0.536),
+                    (1068.425, -0.239),
+                ),
+                "i": (
+                    (2706.861, -0.291),
+                    (38649.389, -0.485),
+                    (1056.128, -0.245),
+                ),
+                "z": (
+                    (6174.420, -0.437),
+                    (6174.420, -0.437),
+                    (6174.420, -0.437),
+                ),
+                "y": (
+                    (261334.672, -0.598),
+                    (261334.672, -0.867),
+                    (439.014, -0.196),
+                ),
+            }
+        else:
+            # Table 3: independent no-halo fits; no y-band calibration.
+            fits = {
+                "u": (579.537, -0.173),
+                "g": (1143.921, -0.241),
+                "r": (1068.425, -0.239),
+                "i": (1056.128, -0.245),
+                "z": (520.751, -0.207),
+            }
+
+    else:
+        mag_min, mag_max = 3.0, 21.0
+
+        if halo:
+            raise ValueError("DP2 supports only halo=False.")
+
+        fits = {
+            "g": (819.1, -0.290),
+            "r": (722.3, -0.283),
+            "i": (675.0, -0.276),
+            "z": (788.0, -0.289),
+        }
+
+    if band not in fits:
+        raise ValueError(
+            f"Unsupported band {band!r} for {survey}, halo={halo}. "
+            f"Available bands: {', '.join(fits)}."
+        )
+
+    G = df[mag_column].to_numpy(dtype=float)
+    if not np.all(np.isfinite(G)):
+        raise ValueError(f"{mag_column!r} must contain finite magnitudes.")
+
+    valid = (G > mag_min) & (G < mag_max)
+    n_outside = int(np.count_nonzero(~valid))
+
+    evaluate = np.ones(G.shape, dtype=bool) if extrapolate else valid
+    G_eval = G[evaluate]
+
+    if survey == "DP1" and halo:
+        coefficients = np.asarray(fits[band], dtype=float)
+        segment = np.searchsorted([13.6, 15.0], G_eval, side="right")
+        A = coefficients[segment, 0]
+        B = coefficients[segment, 1]
+    else:
+        A, B = fits[band]
+
+    radius = np.zeros(G.shape, dtype=float)
+    radius[evaluate] = A * np.exp(B * G_eval) / 3600.0
+
+    df["radius"] = radius
+
+    valid_range = f"{mag_min:g} < G < {mag_max:g}"
+    if extrapolate:
+        print(
+            f"rubin_radfunction ({survey}, halo={halo}): "
+            f"extrapolation enabled; evaluated the fit for "
+            f"{n_outside} stars outside the validity range "
+            f"{valid_range}."
+        )
+    else:
+        print(
+            f"rubin_radfunction ({survey}, halo={halo}): "
+            f"extrapolation disabled; assigned radius=0 to "
+            f"{n_outside} stars outside the validity range "
+            f"{valid_range}."
+        )
+
+    return radius
+
+
 #####################################################################
 ########################  CLASS DEFINITION  #########################
 #####################################################################

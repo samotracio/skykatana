@@ -16,6 +16,9 @@ dataset of the [Vera Rubin Observatory](https://rubinobservatory.org/) and the [
 It can handle multi-billion pixel masks with very limited memory resources and is flexible to 
 accomodate custom recipes for masking different objects.
 
+The code and construction of Rubin masks are described in [Lopez et al. 2026](https://www.sciencedirect.com/science/article/abs/pii/S2213133726000259) 
+(available also in [arxvix:2512.1448](https://arxiv.org/abs/2512.14848))
+
 Main Class
 -------------
 * ``SkyMaskPipe()``
