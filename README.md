@@ -82,3 +82,7 @@ Acknowledgements
 ----------------
 This software was partially developed with the generous support of the [LINCC Frameworks Incubator Program](https://lsstdiscoveryalliance.org/programs/lincc-frameworks/incubators/) using LINCC resources. The [healsparse](https://github.com/LSSTDESC/healsparse) code was written by Eli Rykoff and Javier Sanchez. [mocpy](https://github.com/cds-astro/mocpy) is a fantastic library developed by the mocpy team, and [ipyaladin](https://github.com/cds-astro/ipyaladin) is a great tool to enable interactive sky visualizations.
 
+Code of Conduct
+---------------
+This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md).
+All contributors and participants are expected to adhere to these guidelines.
